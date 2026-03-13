@@ -1,0 +1,33 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "Vigil: An Extensible System for Real-Time Detection and Mitigation of Cognitive Bias Triggers"
+type: software
+authors:
+  - family-names: Kang
+    given-names: Bo
+    affiliation: Ghent University
+  - family-names: Noels
+    given-names: Sander
+    affiliation: Ghent University
+  - family-names: De Bie
+    given-names: Tijl
+    affiliation: Ghent University
+repository-code: "https://github.com/aida-ugent/vigil"
+license: MIT
+keywords:
+  - cognitive bias trigger
+  - persuasive rhetoric
+  - media literacy
+  - browser extension
+  - responsible AI
+preferred-citation:
+  type: generic
+  title: "Vigil: An Extensible System for Real-Time Detection and Mitigation of Cognitive Bias Triggers"
+  authors:
+    - family-names: Kang
+      given-names: Bo
+    - family-names: Noels
+      given-names: Sander
+    - family-names: De Bie
+      given-names: Tijl
+  year: 2026

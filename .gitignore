@@ -1,0 +1,30 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn.lock
+pnpm-lock.yaml
+dist/
+build/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.env
+.env.*
+.pytest_cache/
+.coverage
+.python-version
+
+# OS / editors
+.DS_Store
+Thumbs.db
+
+# Chrome extension zips
+*.crx
+*.zip
+tmp/
+
+# Ruff
+.ruff_cache/
