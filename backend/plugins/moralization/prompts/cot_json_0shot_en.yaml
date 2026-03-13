@@ -1,0 +1,114 @@
+system: "You are an expert linguist specializing in text classification. You will receive a text passage and must determine whether it contains a moralization according to the definition in the user prompt (true) or not (false). You must also extract the protagonists in the moralization, categorize them into classes, and assign roles. Always respond in JSON format according to the output_format."
+user: |+
+    <task_description>
+
+    <part_a>
+    PART A: Determine whether a moralization is present.
+
+    A moralization must simultaneously fulfill three criteria:
+    1. The text must contain references to one or more moral values.
+        - Moral values can be positive (and should be strived for, such as "peace", "safe", "support") or negative (and should be avoided or fought against, such as "injustice", "unfair", or "insult").
+        - Moral values can be expressed through single words (nouns such as "security" or "war", adjectives such as "just" or "unfair", or verbs such as "protect" or "deceive") or phrases (such as "the cruel war" or "the deceitful plan").
+        - Moral values have been studied within Moral Foundations Theory (MFT) and can be classified into the following categories: Care, Harm, Fairness, Cheating, Loyalty, Betrayal, Authority, Subversion, Purity, Degradation, Liberty, Oppression.
+    2. The text must contain a demand to do something, to refrain from something, or to adopt a certain stance.
+        - The demand can be explicit (e.g., "Women should earn as much as men") or implicit ("Women still earn less than men despite equal legal status").
+        - Implicit demands count as demands.
+            - Caution: Implicit demands should be unambiguously reconstructable from context. Do not speculate. If you are unsure, answer with false.
+    3. Link between demand and moral value: The moral value from criterion 1 is used to argumentatively support/reinforce the demand from criterion 2.
+        - The argumentative pattern: Because something is good or bad (moral value), one should do/support or refrain from/avoid it (demand).
+        - Often only a moral value is present but no demand — in this case it is NOT a moralization.
+        - If a demand and a moral value are present but do not stand in an argumentative relation to each other, it is NOT a moralization.
+
+    If all three criteria are met, a moralization is present.
+
+    There is NO moralization if:
+    1. The text contains no moral values and no demand; or
+    2. The text contains one or more moral values but no demand; or
+    3. The text contains a demand but no moral values; or
+    4. The text contains a demand and one or more moral values, but the moral values do not argumentatively support or reinforce the demand (i.e., the moral values are not linked to the demand).
+
+    </part_a>
+
+    <part_b>
+    PART B: Extract protagonists.
+
+    Extract all noun phrases that refer to protagonists. These include:
+    - Individuals (e.g., "Angela Merkel")
+    - Generic humans (e.g., "the children")
+    - Institutions, organizations, parties, coalitions, countries (e.g., "WHO", "the Democrats", "Germany")
+    - Socially definable groups of people (e.g., "the unemployed", "students")
+    - Generic references (e.g., "the people", "the citizens")
+
+    Special rules:
+    - Other references are not annotated (e.g., through adjectives; the "German" interests).
+    - Multiple protagonists in a text are annotated separately.
+    - In rare cases, no protagonists may be mentioned.
+    - If a pronoun and a noun phrase/noun/proper name refer to the same entity with the same role and group affiliation, only the noun phrase/noun/proper name is annotated (not the pronoun).
+    - If the same entity is referred to multiple times with the same role and group affiliation, only the first mention is annotated.
+    - In special cases, the same pronoun may refer to different entities — these are annotated separately.
+    </part_b>
+
+    <part_c>
+    PART C: Categorize protagonists.
+
+    Assign exactly one category to each protagonist:
+    - **Individual** (Specific persons, e.g., "Mr. Smith", "Angela Merkel")
+    - **Generic Human** (Citizens in general, e.g., "people", "the population", "the public")
+    - **Institution** (Institutions/organizations/parties/coalitions/countries, e.g., "Our democratic state", "WHO", "Germany" (only when meant as a protagonist, not as a place))
+    - **Social Group** (Socially definable groups, e.g., "the unemployed", "students", "women", "parents")
+    - **OTHER** (If no other category applies)
+    </part_c>
+
+    <part_d>
+    PART D: Assign roles to protagonists in the moralization.
+
+    If a moralization is present, assign each protagonist a role:
+    - **Demander** (Person/group making the demand)
+    - **Addressee** (Person/group to whom the demand is directed)
+    - **Beneficiary** (Person/group who benefits from the demand)
+    - **Maleficiary** (Person/group negatively affected by the demand)
+    - **Unclear** (If you are sure the person/group plays an important role in the moralization but unsure which one)
+    - **NONE** (Protagonists unrelated to the moralization)
+
+    Special cases:
+    - Multiple roles are possible (e.g., "We want European integration because we depend on it." Here "we" is simultaneously Beneficiary, Addressee, and Demander).
+    - An inclusive "we/us" (e.g., "We must/should do x...") typically refers to **Addressee + Demander**.
+    </part_d>
+
+    </task_description>
+
+    <questions>
+    i) Derive whether, according to the criteria in <part_a>, a moralization is present in the following <text> or not.
+    ii) Then decide whether a moralization is present or not. Answer true or false.
+    iii) - Extract the protagonists according to <part_b>.
+         - Categorize them according to <part_c>.
+         - Assign them roles according to <part_d>.
+    </questions>
+
+    <output_format>
+    {{
+        "moralization": {{
+            "moral_values": [
+                {{
+                    "text": "string",
+                    "moral_foundations_theory_categories": ["Care", "Harm", "Fairness", "Cheating", "Loyalty", "Betrayal", "Authority", "Subversion", "Purity", "Degradation", "Liberty", "Oppression"]
+                }},
+                ...
+            ],
+            "demand": "string",
+            "contains_moralization": "boolean"
+        }},
+        "protagonists": [
+            {{
+                "text": "string",
+                "category": ("Individual" | "Generic Human" | "Institution" | "Social Group" | "OTHER"),
+                "roles": ["Demander", "Addressee", "Beneficiary", "Maleficiary", "Unclear", "NONE"]
+            }},
+            ...
+        ]
+    }}
+    </output_format>
+
+    <text>
+    {text}
+    </text>

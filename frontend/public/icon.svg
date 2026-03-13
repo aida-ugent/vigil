@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Vigil icon">
+  <!-- Shield: brand-blue fill -->
+  <path d="M64 2c-22 16-42 20-54 20v46c0 34 20 52 54 58 34-6 54-24 54-58V22c-12 0-32-4-54-20z"
+        fill="#11b7dd"/>
+  <!-- Bold V lettermark: white -->
+  <path d="M40 42l24 52 24-52" fill="none" stroke="#ffffff" stroke-width="11"
+        stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

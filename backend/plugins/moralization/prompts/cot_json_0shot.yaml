@@ -1,0 +1,114 @@
+system: "Du bist ein Experte der Linguistik für die Klassifikation von Texten. Du bekommst einen Textausschnitt und musst entscheiden, ob er eine Moralisierung nach der Definition aus dem User Prompt enthält (true) oder nicht (false). Außerdem musst du die Protagonisten in der Moralisierung extrahieren, in Klassen kategorisieren und Rollen zuordnen. Antworte immer im JSON Format gemäß dem output_format."
+user: |+
+    <aufgabenbeschreibung>
+
+    <teil_a>
+    TEIL A: Bestimme, ob eine Moralisierung vorliegt.
+
+    Eine Moralisierung muss drei Kriterien gleichzeitig erfüllen:
+    1. Der Text muss Hinweise auf einen oder mehrere moralische Werte enthalten.
+        - Moralische Werte können positiv sein (und sollten angestrebt werden, wie beispielsweise "Frieden", "sicher", "unterstützen") oder negativ (und sollten vermieden oder bekämpft werden, wie beispielsweise "Ungerechtigkeit", "unfair", oder "beleidigen").
+        - Moralische Werte können durch einzelne Wörter (Nomen wie beispielsweise "Sicherheit" oder "Krieg", Adjektive wie beispielsweise "gerecht" oder "unfair", oder Verben wie beispielsweise "absichern" oder "betrügen") oder Phrasen (wie beispielsweise "der grausame Krieg" oder "der hinterlistige Plan") ausgedrückt werden.
+        - Moralische Werte wurden im Rahmen der Moral Foundations Theory (MFT) untersucht und können in folgende Kategorien eingeteilt werden: Fürsorge, Schaden, Fairness, Betrug, Loyalität, Verrat, Autorität, Untergrabung von Autorität, Reinheit, Verfall, Freiheit, Unterdrückung.
+    2. Der Text muss eine Forderung enthalten, etwas zu tun, etwas zu unterlassen, oder eine bestimmte Haltung einzunehmen.
+        - Die Forderung kann explizit (z.B. "Frauen sollen so viel verdienen wie Männer") oder implizit ("Frauen verdienen trotz gleichem gesetzlichen Status immer noch weniger als Männer") sein.
+        - Implizite Forderungen kommen vor und zählen als Forderungen.
+            - Achtung: Implizite Forderungen sollten zweifelsfrei aus dem Kontext rekonstruierbar sein. Es sollte hierbei nicht spekuliert werden. Wenn du dir unsicher bist, antworte mit False.
+    3. Verknüpfung von Forderung und moralischem Wert: Der moralische Wert aus Kriterium 2 wird eingesetzt, um die Forderung aus Kriterium 1 argumentativ zu unterstützen/ zu bekräftigen.
+        - Das argumentative Muster: Weil etwas gut oder schlecht ist (moralischer Wert), sollte man es tun/unterstützen oder unterlassen/vermeiden (Forderung).
+        - Oft liegt nur ein moralischer Wert vor, aber keine Forderung, in diesem Fall handelt es sich um keine Moralisierung.
+        - Kommt eine Forderung und ein moralischer Wert vor, die nicht in einer argumentativen Relation zueinander stehen, handelt es sich um keine Moralisierung.
+
+    Wenn alle drei Kriterien erfüllt sind, liegt eine Moralisierung vor.
+
+    Es liegt keine Moralisierung vor, wenn:
+    1. Der Text keine moralischen Werte und keine Forderung enthält; oder
+    2. Der Text einen oder mehrere moralische Werte, aber keine Forderung enthält; oder
+    3. Der Text eine Forderung, aber keine moralischen Werte enthält; oder
+    4. Der Text eine Forderung und einen oder mehrere moralische Werte enthält, die moralischen Werte die Forderung aber nicht argumentativ unterstützen oder bekräftigen (wenn die moralischen Werte also nicht mit der Forderung verknüpft sind).
+
+    </teil_a>
+
+    <teil_b>
+    TEIL B: Extrahiere Protagonisten.
+
+    Extrahiere alle Nominalphrasen, die sich auf Protagonisten beziehen. Dazu zählen:
+    - Individuen (z.B. "Angela Merkel")
+    - Menschengruppen (z.B. "die Kinder")
+    - Institutionen, Organisationen, Parteien, Koalitionen, Länder (z.B. "WHO", "SPD", "Deutschland")
+    - Sozial definierbare Personengruppen (z.B. "die Arbeitslosen", "Studierende")
+    - Generische Verweise (z.B. "das Volk", "die Bürger")
+
+    Sonderregeln:
+    - Andere Referenzen werden nicht annotiert (z.B. durch Adjektive; die "deutschen" Interessen).
+    - Oft werden mehrere Protagonist:innen in einem Text genannt. In diesem Fall werden diese separat annotiert. 
+    - In seltenen Fällen kann es vorkommen, dass keine Protagonisten genannt werden.
+    - Verweist ein Pronomen und eine Nominalphrase/ein Nomen/ein Eigenname auf die gleiche Entität mit der gleichen Rolle und Gruppenzugehörigkeit, wird das Pronomen nicht annotiert, sondern nur die Nominalphrase/das Nomen/der Eigenname (z.B. “Sie haben die Menschen getäuscht und belogen, meine Damen und Herren von der Regierung!” Hier wird die Anrede “Sie” nicht annotiert, da die Entität mit der Phrase “meine Damen und Herren von der Regierung” bereits erfasst ist).
+    - Wenn innerhalb eines Textausschnitts mit gleichen oder unterschiedlichen Wörtern auf die gleiche Entität mit der gleichen Rolle und Gruppenzugehörigkeit verwiesen wird, wird immer nur die zuerst genannte Nominalphrase/das Nomen/der Eigenname annotiert (z.B. "Wir müssen unsere Kinder vor solchen Übergriffen schützen, denn Kinder brauchen ein sicheres Umfeld." Hier wird nur die erste Nennung ("unsere Kinder") annotiert).
+    - In einigen Sonderfällen kann sich das gleiche Personalpronomen auf unterschiedliche Entitäten beziehen, dann werden diese separat annotiert (z.B. "Wir wollen die europäische Integration, weil wir von ihr leben." Hier bezieht sich das erste "wir" auf eine institutionelle Gruppe, die als Forderer auftritt, und das zweite "wir" auf die Menschen im generischen Sinne, die von der Forderung profitieren.).
+    </teil_b>
+
+    <teil_c>
+    TEIL C: Kategorisiere Protagonisten.
+
+    Weise jedem Protagonisten genau eine Kategorie zu:
+    - **Individuum** (Bestimmte Personen, z.B. "Herr Müller", "Angela Merkel")
+    - **Menschen** (Bürger allgemein, z.B. "Menschen", "die Bevölkerung", "die Menschen", "das Volk", "die Berliner", "die Anwohner")
+    - **Institution** (Institutionen/Organisationen/Parteien/ Koalitionen/Ländern etc., z.B. "Unser demokratischer Staat", "SPD", "WHO", "Deutschland" (Nur wenn dieses als Protagonist und nicht als Ort gemeint ist))
+    - **Soziale Gruppe** (Sozial definierbare Personengruppen, z.B. "die Arbeitslosen", "Studierende", "Frauen", "Eltern", "die arbeitende Bevölkerung")
+    - **OTHER** (Wenn keine andere Kategorie zutrifft)
+    </teil_c>
+
+    <teil_d>
+    TEIL D: Weise Protagonisten Rollen in der Moralisierung zu.
+
+    Falls eine Moralisierung vorliegt, weise jedem Protagonisten eine Rolle zu:
+    - **Forderer:in** (Person/Personengruppe, die die Forderung vorbringt)
+    - **Adressat:in** (Person/Personengruppe, an die sich die Forderung richtet)
+    - **Benefizient:in** (Person/Personengruppe, die die Nutznießer:in der Forderung ist – also der/diejenige, dem/der die Forderung zugute kommt/kommen soll bzw. die Umsetzung der Forderung zugute kommen würde bzw. der/diejenige, die derzeit unter den Handlungen des Adressaten leidet)
+    - **Malefizient:in** (Person/Personengruppe, die von der Forderung negativ betroffen ist – also der/diejenige, dem/der die Forderung schadet bzw. zum Nachteil gereicht)
+    - **Bezug unklar** (Wenn du dir sicher bist, dass die Person/Personengruppe eine wichtige Rolle bei der Moralisierung spielt, aber du dir unsicher bist, welche Rolle genau)
+    - **NONE** (Protagonisten, die in keinem Zusammenhang mit der Moralisierung stehen)
+
+    Besonderheiten:
+    - Mehrfachrollen sind möglich (z.B. "Wir wollen die europäische Integration, weil wir von ihr leben." Hier ist das Pronomen wir gleichzeitig Benefizient, Adressat, und Forderer).
+    - Ein inkludierendes "wir/uns" (z.B. "Wir" müssen, sollten x tun...) bezieht sich in der Regel auf **Adressat:in + Forderer:in**.
+    </teil_d>
+
+    </aufgabenbeschreibung>
+
+    <fragen>
+    i) Leite her, ob gemäß den obigen Kriterien in der <teil_a> eine Moralisierung im folgenden <text> vorliegt oder nicht. 
+    ii) Entscheide daraufhin, ob eine Moralisierung vorliegt oder nicht. Antworte true oder false.
+    iii) - Extrahiere gemäß <teil_b> die Protagonisten.  
+         - Kategorisiere sie nach <teil_c>.  
+         - Weise ihnen Rollen nach <teil_d> zu.  
+    </fragen>
+
+    <output_format>
+    {{
+        "moralisierung": {{
+            "moral_werte": [
+                {{
+                    "text": "string",
+                    "moral_foundations_theory_kategorien": ["Fürsorge", "Schaden", "Fairness", "Betrug", "Loyalität", "Verrat", "Autorität", "Untergrabung von Autorität", "Reinheit", "Verfall", "Freiheit", "Unterdrückung"]
+                }},
+                ...
+            ],
+            "forderung": "string",
+            "enthaelt_moralisierung": "boolean"
+        }},
+        "protagonisten": [
+            {{
+                "text": "string",
+                "kategorie": ("Individuum" | "Menschen" | "Institution" | "Soziale Gruppe" | "OTHER"),
+                "rollen": ["Forderer:in", "Adressat:in", "Benefizient:in", "Malefizient:in", "Bezug unklar", "NONE"]
+            }},
+            ...
+        ]
+    }}
+    </output_format>
+
+    <text>
+    {text}
+    </text>

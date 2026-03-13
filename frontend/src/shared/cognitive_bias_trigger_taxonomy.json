@@ -1,0 +1,111 @@
+{
+  "source": "Da San Martino et al. (2020) SemEval-2020 Task 11 — Propaganda Technique Detection",
+  "sourceUrl": "https://propaganda.qcri.org/semeval2020-task11/",
+  "reference": "Sprenkamp et al. (2023) Large Language Models for Propaganda Detection — EMNLP 2023",
+  "systemPrompt": "You detect cognitive bias triggers in text.\n\nA cognitive bias trigger is a rhetorical pattern that exploits a cognitive vulnerability in readers, nudging them toward irrational judgment. Analyze the given text and identify ALL instances of cognitive bias triggers from the following 14 types. For each instance, extract a short term (1-6 words) directly copied from the text so it can be highlighted.\n\n## Cognitive Bias Trigger Types\n\n1. **Loaded_Language**: Words or phrases with strong emotional connotations (positive or negative) used to influence the audience. Triggers the affect heuristic. E.g. \"a plague on our nation\" or \"a beacon of hope.\"\n2. **Name_Calling_Labeling**: Attaching a negative label to a person, group, or idea to reject it without evidence. Triggers anchoring and framing effects. E.g. \"liberal elite\" or \"far-right extremist.\"\n3. **Repetition**: Repeating the same message or phrase to make it seem more true. Triggers the illusory truth effect. E.g. \"Lock her up! Lock her up!\"\n4. **Exaggeration_Minimisation**: Overstating or understating reality to make something seem better or worse than it is. Triggers anchoring and contrast effects. E.g. \"the greatest deal in history\" or \"a minor inconvenience.\"\n5. **Doubt**: Questioning the credibility of a person or idea without evidence. Triggers uncertainty aversion. E.g. \"Can we really trust what they say?\"\n6. **Appeal_to_Fear_Prejudice**: Seeking to build support by instilling fear or prejudice toward an alternative. Triggers the availability heuristic and fear responses. E.g. \"If we don't act now, our way of life will be destroyed.\"\n7. **Flag_Waving**: Playing on strong national, group, or identity feelings to justify or promote an action. Triggers in-group bias. E.g. \"A true patriot would support this.\"\n8. **Causal_Oversimplification**: Assuming a single cause for a complex issue, ignoring other contributing factors. Triggers the illusion of causality. E.g. \"Immigration is the reason for all our economic problems.\"\n9. **Slogans**: Short, catchy phrases used as substitutes for reasoned argument. Triggers processing fluency bias. E.g. \"Make America Great Again.\"\n10. **Appeal_to_Authority**: Using the opinion of an authority figure as evidence, often outside their area of expertise. Triggers authority bias. E.g. \"A Nobel laureate in physics says this economic policy is correct.\"\n11. **Black_and_White_Fallacy**: Presenting only two options when more exist, forcing a choice between extremes. Triggers binary thinking bias. E.g. \"You're either with us or against us.\"\n12. **Thought_Terminating_Cliches**: Using a commonly known phrase or saying to quash critical thought. Triggers cognitive closure. E.g. \"It is what it is\" or \"Everything happens for a reason.\"\n13. **Whataboutism_Straw_Men_Red_Herring**: Deflecting criticism by raising a different issue, misrepresenting the opponent's argument, or introducing irrelevant material. Triggers deflection and false equivalence. E.g. \"What about when they did the same thing?\"\n14. **Bandwagon_Reductio_ad_Hitlerum**: Arguing that something must be true because many believe it, or discrediting an idea by associating it with a despised figure. Triggers bandwagon effect. E.g. \"Millions of people support this\" or \"That's exactly what Hitler would say.\"\n\nReturn strict JSON with fields: findings=[{term, label, severity, explanation, cognitiveBias}], tips=[string].\nUse ONLY label names from the list above (e.g. \"Loaded_Language\", \"Appeal_to_Fear_Prejudice\").\nUse severities: low | medium | high.\nThe cognitiveBias field should name the cognitive bias being triggered (e.g. \"Affect heuristic\", \"Illusory truth effect\").\nKeep explanations under ~400 characters.\n\nCONTEXT AWARENESS:\n- Questions (sentences ending in '?') can still be triggers (e.g. rhetorical questions that seed doubt).\n- Scientific or academic language is generally not manipulative. Skip or use 'low' severity.\n- Focus on genuinely manipulative rhetorical patterns: emotional loading, fear appeals, false dichotomies, identity exploitation.\n- Be precise with labels. Do not default to Loaded_Language when a more specific label fits.",
+  "userPromptPrefix": "Analyze the following text for cognitive bias triggers — rhetorical patterns that exploit cognitive vulnerabilities in readers. Be concise and precise.",
+  "userPromptSuffix": "Return ONLY JSON.",
+  "maxTextLength": 8000,
+  "techniques": [
+    {
+      "label": "Loaded_Language",
+      "description": "Words or phrases with strong emotional connotations used to influence the audience without rational argument.",
+      "cognitiveBias": "Affect heuristic",
+      "severity": "high"
+    },
+    {
+      "label": "Name_Calling_Labeling",
+      "description": "Attaching a negative label to a person, group, or idea to reject it without examining the evidence.",
+      "cognitiveBias": "Anchoring / Framing effect",
+      "severity": "high"
+    },
+    {
+      "label": "Repetition",
+      "description": "Repeating the same message or phrase to make it seem more true or important than it is.",
+      "cognitiveBias": "Illusory truth effect",
+      "severity": "medium"
+    },
+    {
+      "label": "Exaggeration_Minimisation",
+      "description": "Overstating or understating reality to distort the reader's perception of significance.",
+      "cognitiveBias": "Anchoring / Contrast effect",
+      "severity": "medium"
+    },
+    {
+      "label": "Doubt",
+      "description": "Questioning credibility without evidence, creating suspicion through insinuation rather than argument.",
+      "cognitiveBias": "Uncertainty aversion",
+      "severity": "medium"
+    },
+    {
+      "label": "Appeal_to_Fear_Prejudice",
+      "description": "Building support by instilling fear or prejudice toward an alternative, bypassing rational evaluation.",
+      "cognitiveBias": "Availability heuristic / Fear response",
+      "severity": "high"
+    },
+    {
+      "label": "Flag_Waving",
+      "description": "Playing on national, group, or identity feelings to justify an action without substantive argument.",
+      "cognitiveBias": "In-group bias",
+      "severity": "medium"
+    },
+    {
+      "label": "Causal_Oversimplification",
+      "description": "Assuming a single cause for a complex issue, ignoring other contributing factors.",
+      "cognitiveBias": "Illusion of causality",
+      "severity": "medium"
+    },
+    {
+      "label": "Slogans",
+      "description": "Short, catchy phrases used as substitutes for reasoned argument.",
+      "cognitiveBias": "Processing fluency bias",
+      "severity": "low"
+    },
+    {
+      "label": "Appeal_to_Authority",
+      "description": "Using the opinion of an authority figure as evidence, often outside their area of expertise.",
+      "cognitiveBias": "Authority bias",
+      "severity": "medium"
+    },
+    {
+      "label": "Black_and_White_Fallacy",
+      "description": "Presenting only two options when more exist, forcing a false choice between extremes.",
+      "cognitiveBias": "Binary thinking bias",
+      "severity": "medium"
+    },
+    {
+      "label": "Thought_Terminating_Cliches",
+      "description": "Using a commonly known phrase or saying to quash critical thinking and end debate.",
+      "cognitiveBias": "Cognitive closure",
+      "severity": "low"
+    },
+    {
+      "label": "Whataboutism_Straw_Men_Red_Herring",
+      "description": "Deflecting criticism by raising a different issue, misrepresenting the opponent's argument, or introducing irrelevant material.",
+      "cognitiveBias": "Deflection / False equivalence",
+      "severity": "medium"
+    },
+    {
+      "label": "Bandwagon_Reductio_ad_Hitlerum",
+      "description": "Arguing something must be true because many believe it, or discrediting an idea by associating it with a despised figure.",
+      "cognitiveBias": "Bandwagon effect",
+      "severity": "medium"
+    }
+  ],
+  "datasetMapping": {
+    "Loaded_Language": "Loaded_Language",
+    "Name_Calling,Labeling": "Name_Calling_Labeling",
+    "Repetition": "Repetition",
+    "Exaggeration,Minimisation": "Exaggeration_Minimisation",
+    "Doubt": "Doubt",
+    "Appeal_to_fear-prejudice": "Appeal_to_Fear_Prejudice",
+    "Flag-Waving": "Flag_Waving",
+    "Causal_Oversimplification": "Causal_Oversimplification",
+    "Slogans": "Slogans",
+    "Appeal_to_Authority": "Appeal_to_Authority",
+    "Black-and-White_Fallacy": "Black_and_White_Fallacy",
+    "Thought-terminating_Cliches": "Thought_Terminating_Cliches",
+    "Whataboutism,Straw_Men,Red_Herring": "Whataboutism_Straw_Men_Red_Herring",
+    "Bandwagon,Reductio_ad_hitlerum": "Bandwagon_Reductio_ad_Hitlerum"
+  }
+}
