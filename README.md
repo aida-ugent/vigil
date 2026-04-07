@@ -206,9 +206,12 @@ If you use Vigil in your research, please cite:
 
 ```bibtex
 @misc{kang2026vigil,
-  title  = {Vigil: An Extensible System for Real-Time Detection and Mitigation of Cognitive Bias Triggers},
-  author = {Kang, Bo and Noels, Sander and De Bie, Tijl},
-  year   = {2026}
+  title         = {Vigil: An Extensible System for Real-Time Detection and Mitigation of Cognitive Bias Triggers},
+  author        = {Kang, Bo and Noels, Sander and De Bie, Tijl},
+  year          = {2026},
+  eprint        = {2604.03261},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.CL}
 }
 ```
 
