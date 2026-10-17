@@ -1,0 +1,18 @@
+.cb-diagnostics {
+  position: fixed; inset: 8px; margin: auto; width: calc(100% - 16px); max-width: 760px;
+  height: calc(100% - 16px); max-height: calc(100% - 16px); box-sizing: border-box;
+  overflow-y: auto; background: #fff; color: #172033; border: 1px solid #cbd5e1;
+  border-radius: 10px; padding: 16px; font: 13px/1.5 system-ui, sans-serif;
+}
+.cb-diagnostics::backdrop { background: #0f172a88; }
+.cb-diagnostics header { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.cb-diagnostics h1 { font-size: 18px; margin: 0; }
+.cb-diagnostics h2 { font-size: 14px; margin: 16px 0 6px; }
+.cb-diagnostics button { font: inherit; cursor: pointer; border: 1px solid #94a3b8; border-radius: 5px; padding: 4px 8px; background: #f8fafc; color: #172033; }
+.cb-diagnostics button:disabled { opacity: .5; cursor: default; }
+.cb-diagnostics-actions { display: flex; gap: 8px; }
+.cb-diagnostics details { border-top: 1px solid #e2e8f0; padding: 10px 0; }
+.cb-diagnostics summary { cursor: pointer; font-weight: 600; }
+.cb-diagnostics pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.5 monospace; background: #f1f5f9; padding: 10px; }
+.cb-diagnostics p { margin: 8px 0; overflow-wrap: anywhere; }
+.cb-diagnostics a { color: #1d4ed8; }

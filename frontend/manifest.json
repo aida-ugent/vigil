@@ -17,7 +17,7 @@
       "48": "icons/icon-48.png"
     }
   },
-  "permissions": ["sidePanel", "storage", "tabs", "offscreen"],
+  "permissions": ["sidePanel", "storage", "tabs", "offscreen", "webNavigation"],
   "host_permissions": ["<all_urls>"],
   "background": {
     "service_worker": "src/background/index.ts",

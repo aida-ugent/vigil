@@ -18,7 +18,7 @@ import {
 } from "../shared/settingsStorage";
 import { getWebLLMService } from "../llm/webllm";
 import { browserPluginRegistry } from "../plugins/registry";
-import { createServerClient, type ServerClient } from "../plugins/server/client";
+import { createServerClient } from "../plugins/server/client";
 
 type StatusCallback = (message: string, state: "idle" | "saved" | "error") => void;
 type PanelStatusCallback = (message: string, tone: "neutral" | "success" | "warning" | "error") => void;
@@ -125,7 +125,6 @@ function renderPluginItem(opts: PluginItemOptions): HTMLLabelElement {
 // ── Controller ──
 
 export function createSettingsController(deps: SettingsControllerDeps) {
-  let serverClient: ServerClient = createServerClient(deps.getCurrentSettings().serverUrl);
 
   async function persistPatch(patch: Partial<VigilSettings>): Promise<void> {
     try {
@@ -154,9 +153,7 @@ export function createSettingsController(deps: SettingsControllerDeps) {
   }
 
   function updateLlmSectionVisibility(): void {
-    const settings = deps.getCurrentSettings();
-    const needsLlm = anySelectedPluginNeedsLLM(settings.selectedBrowserPlugins);
-    if (llmProviderSection) llmProviderSection.style.display = needsLlm ? "" : "none";
+    if (llmProviderSection) llmProviderSection.style.display = ""; // Also configures history-based confirmation analysis.
   }
 
   // ── WebLLM ──
@@ -194,17 +191,27 @@ export function createSettingsController(deps: SettingsControllerDeps) {
 
   async function checkServerAndLoadPlugins(): Promise<void> {
     const settings = deps.getCurrentSettings();
+    // Read the field directly: a click can race the asynchronous blur/change save.
+    const url = serverUrlInput instanceof HTMLInputElement ? serverUrlInput.value.trim() : settings.serverUrl;
+    if (!/^https?:\/\//i.test(url)) {
+      deps.onPanelStatus("Enter an HTTP or HTTPS plugin server URL.", "error");
+      return;
+    }
+    const serverClient = createServerClient(url);
+    if (url !== settings.serverUrl) await persistPatch({ serverUrl: url });
     if (serverStatusDot) serverStatusDot.setAttribute("data-state", "unknown");
 
     const healthy = await serverClient.checkHealth();
     if (serverStatusDot) serverStatusDot.setAttribute("data-state", healthy ? "online" : "offline");
     if (!healthy || !serverPluginsList) {
       if (serverPluginsList) serverPluginsList.style.display = "none";
+      deps.onPanelStatus(`Cannot connect to ${url}. Check that your SSH tunnel is running.`, "error");
       return;
     }
 
     try {
       const resp = await serverClient.fetchPlugins();
+      deps.onPanelStatus(`Connected to ${url}.`, "success");
       serverPluginsList.style.display = "";
       serverPluginsList.innerHTML = "";
       for (const p of resp.analyzers) {
@@ -229,6 +236,7 @@ export function createSettingsController(deps: SettingsControllerDeps) {
     } catch (error) {
       console.warn("[Vigil v2] Failed to fetch server plugins:", error);
       serverPluginsList.style.display = "none";
+      deps.onPanelStatus(`Connected to ${url}, but could not load its plugins.`, "error");
     }
   }
 
@@ -282,13 +290,10 @@ export function createSettingsController(deps: SettingsControllerDeps) {
   // ── render (called on every settings load/update) ──
 
   function render(settings: VigilSettings): void {
-    if (settings.serverUrl !== deps.getCurrentSettings().serverUrl) {
-      serverClient = createServerClient(settings.serverUrl);
-    }
 
     renderBrowserPlugins();
 
-    const effectiveBackend = settings.llmBackend === "none" ? "local-api" : settings.llmBackend;
+    const effectiveBackend = settings.llmBackend;
     if (llmBackendSelect instanceof HTMLSelectElement) llmBackendSelect.value = effectiveBackend;
     updateLlmSectionVisibility();
     updateBackendVisibility(effectiveBackend);

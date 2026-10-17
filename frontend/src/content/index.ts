@@ -1,3 +1,4 @@
+import { startActivityCollection } from "../activity/collector";
 import { sendRuntimeMessage, type ApplyReformulationPayload } from "../shared/messages";
 import type { TweetExtractionItem } from "../shared/platform";
 import type { ContentAnalysisResult } from "../shared/content";
@@ -9,6 +10,8 @@ import { applyReformulation, restoreOriginal, addVerifiedBadge, addAnalyzedBadge
 import { hideContent, unhideContent, obscureContent, revealContent } from "./contentHider";
 import { findTweetArticle } from "./domUtils";
 import type { ReformulationSegment } from "./tweetParser";
+
+startActivityCollection();
 
 const viewportTracker = new ViewportTracker((update) => {
   try {

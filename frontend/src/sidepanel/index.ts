@@ -1,3 +1,9 @@
+import { initializeConfirmationDiagnosticsView } from "../diagnostics/view";
+import { confirmationDiagnostics } from "../diagnostics/confirmation";
+import { getActivitySettings } from "../activity/model";
+import { ConfirmationAnalysisService } from "./confirmationAnalysisService";
+import { initializeActivityPanel } from "../activity/panel";
+import { PLUGIN_ID as CONFIRMATION_PLUGIN_ID } from "../plugins/confirmationBias";
 import "./styles.css";
 import {
   DEFAULT_SETTINGS,
@@ -71,6 +77,9 @@ const clearCacheBtn = document.getElementById("clear-cache-btn");
 const exportCacheBtn = document.getElementById("export-cache-btn");
 
 // ── State ──
+
+let analysisGeneration = 0;
+let activeTabId: number | null = null;
 
 let currentSettings: VigilSettings = DEFAULT_SETTINGS;
 let currentLLM: LLMService = resolveLLMService(DEFAULT_SETTINGS);
@@ -355,7 +364,7 @@ async function analyzeSingleItem(item: ContentItem, forceRefresh = false): Promi
   if (analyzingIds.has(item.id)) return;
 
   const activePluginIds = getActivePluginIds(currentSettings);
-  if (activePluginIds.length === 0) {
+  if (activePluginIds.length === 0 && !(await getActivitySettings()).confirmation) {
     setPanelStatus("No plugins selected. Enable at least one plugin in Settings.", "error");
     return;
   }
@@ -368,6 +377,8 @@ async function analyzeSingleItem(item: ContentItem, forceRefresh = false): Promi
     void sendRuntimeMessage({ type: "OBSCURE_CONTENT_REQUEST", payload: { contentId: item.id } });
   }
 
+  const generation = analysisGeneration;
+  const originalTabId = activeTabId;
   analyzingIds.add(item.id);
   if (analyzeCurrentBtn instanceof HTMLButtonElement) {
     analyzeCurrentBtn.innerHTML = SPINNER_HTML + " Analyzing\u2026";
@@ -377,10 +388,29 @@ async function analyzeSingleItem(item: ContentItem, forceRefresh = false): Promi
 
   try {
     const { result: newResult, pipelineInfo } = await runAnalysis(item, currentSettings, { forceRefresh });
+    if (generation !== analysisGeneration) {
+      if (willAutoAct && originalTabId !== null) {
+        void chrome.tabs.sendMessage(originalTabId, {
+          type: "REVEAL_CONTENT",
+          payload: { contentId: item.id },
+        }).catch(() => {});
+      }
+      return;
+    }
     upsertResult(newResult);
     renderContentAnalysisResults(contentAnalysisResults);
     await sendContentHighlights(contentAnalysisResults);
     renderViewingCard();
+    void confirmationAnalysis.analyze({
+      item,
+      base: newResult,
+      generation,
+      tabId: originalTabId,
+      llm: currentLLM,
+      model: currentSettings.llmBackend === "cloud-api" ? currentSettings.cloudModelId
+        : currentSettings.llmBackend === "local-api" ? currentSettings.localModelId
+        : currentSettings.llmBackend === "webllm" ? currentSettings.webllmModelId : undefined,
+    });
 
     if (newResult.cached) {
       setPanelStatus(`${newResult.findings.length} findings (cached).`, newResult.findings.length > 0 ? "success" : "neutral");
@@ -410,6 +440,55 @@ async function analyzeSingleItem(item: ContentItem, forceRefresh = false): Promi
     }
     void updateCacheStats();
   }
+}
+
+const confirmationAnalysis = new ConfirmationAnalysisService({
+  isCurrent: ({ item, generation, tabId }) => {
+    const result = contentAnalysisResults.find(r => r.id === item.id);
+    return generation === analysisGeneration && tabId === activeTabId && result?.text === item.text;
+  },
+  onStatus: message => {
+    const status = document.getElementById("confirmation-status");
+    if (status) status.textContent = message;
+  },
+  onResult: async ({ item, generation, tabId }, result) => {
+    const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    const current = contentAnalysisResults.find(entry => entry.id === item.id);
+    if (
+      generation !== analysisGeneration ||
+      activeTab?.id !== tabId ||
+      activeTab.url !== item.pageUrl ||
+      current?.text !== item.text
+    ) return;
+    upsertResult(result);
+    renderContentAnalysisResults(contentAnalysisResults);
+    renderViewingCard();
+    if (tabId !== null) {
+      await chrome.tabs.sendMessage(tabId, {
+        type: "HIGHLIGHT_FINDINGS",
+        payload: { results: contentAnalysisResults },
+      });
+      if (result.findings.length > 0) {
+        await chrome.tabs.sendMessage(tabId, {
+          type: "MARK_ANALYZED",
+          payload: { contentId: item.id, count: result.findings.length },
+        });
+      }
+    }
+  },
+});
+
+function invalidateConfirmation(): void {
+  confirmationDiagnostics.clear();
+  analysisGeneration++;
+  const status = document.getElementById("confirmation-status");
+  if (status) status.textContent = "";
+  for (const result of contentAnalysisResults) {
+    result.findings = result.findings.filter(f => f.pluginId !== CONFIRMATION_PLUGIN_ID);
+  }
+  renderContentAnalysisResults(contentAnalysisResults);
+  renderViewingCard();
+  void sendContentHighlights(contentAnalysisResults);
 }
 
 function upsertResult(result: ContentAnalysisResult): void {
@@ -685,6 +764,9 @@ function updateRewriteButtonState(): void {
 // ── Runtime connection ──
 
 function clearTransientState(): void {
+  analysisGeneration++;
+  const status = document.getElementById("confirmation-status");
+  if (status) status.textContent = "";
   setContentReady(false);
   clearContentAnalysis();
   setHighlightStatus("", false);
@@ -714,6 +796,7 @@ async function initializeRuntimeConnection(): Promise<void> {
     await sendRuntimeMessage({ type: "PING" });
     setConnectionState("connected");
     const activeTab = await sendRuntimeMessage({ type: "GET_ACTIVE_TAB" });
+    activeTabId = activeTab.payload.tabId;
     setRuntimeTab(activeTab.payload.url);
     currentPageUrl = activeTab.payload.url ?? "";
     await probeContentScript(activeTab.payload.tabId);
@@ -728,8 +811,14 @@ async function initializeRuntimeConnection(): Promise<void> {
 // ── Event bindings ──
 
 function bindRuntimeEvents(): void {
-  chrome.runtime.onMessage.addListener((message) => {
+  chrome.tabs.onActivated.addListener(() => {
+    clearTransientState();
+    void initializeRuntimeConnection();
+  });
+  chrome.runtime.onMessage.addListener((message, sender) => {
     if (!isRuntimeEventMessage(message)) return;
+    if (message.type === "VISIBLE_CONTENT_CHANGED" && sender.tab?.id !== activeTabId) return;
+    if (message.type === "TAB_NAVIGATED" && message.payload.tabId !== activeTabId) return;
     if (message.type === "TAB_NAVIGATED") {
       setConnectionState("connected");
       setRuntimeTab(message.payload.url);
@@ -793,6 +882,7 @@ function bindAnalyzeActions(): void {
 // ── Render on settings change ──
 
 function render(settings: VigilSettings): void {
+  invalidateConfirmation();
   currentSettings = settings;
   currentLLM = resolveLLMService(settings);
   settingsCtrl.render(settings);
@@ -811,6 +901,8 @@ async function init(): Promise<void> {
 
   bindRuntimeEvents();
   bindAnalyzeActions();
+  initializeActivityPanel(invalidateConfirmation);
+  initializeConfirmationDiagnosticsView();
   settingsCtrl.bind();
   await initializeRuntimeConnection();
 

@@ -1,3 +1,5 @@
+import { addConfirmationBadge, clearConfirmationBadges } from "./confirmationBadge";
+import { CONFIRMATION_PLUGIN_ID } from "../shared/confirmation";
 import { formatFindingMeta, type Finding } from "../shared/findings";
 import type { HighlightResult } from "../shared/platform";
 import type { ContentAnalysisResult } from "../shared/content";
@@ -18,13 +20,36 @@ const HIGHLIGHT_CLASS = "vigil-highlight";
 const TOOLTIP_CLASS = "vigil-tooltip";
 const TOOLTIP_ROOT_ID = "vigil-tooltip-root";
 const HIGHLIGHT_DATA_ATTR = "data-vigil-highlight";
+const THEME_ATTR = "data-vigil-theme";
 
 const VIEWPORT_MARGIN = 8;
 const TOOLTIP_GAP = 10;
 
 /** Highlight marks live in light DOM (they wrap existing text), scoped by class name. */
 const HIGHLIGHT_CSS = `
-.${HIGHLIGHT_CLASS} {
+:root {
+  --vigil-high: #e53e3e;
+  --vigil-high-bg: rgba(229, 62, 62, 0.10);
+  --vigil-medium: #dd6b20;
+  --vigil-medium-bg: rgba(221, 107, 32, 0.08);
+  --vigil-low: #d69e2e;
+  --vigil-low-bg: rgba(214, 158, 46, 0.08);
+}
+/* Saturated mid-tones disappear against X's Dim and Lights-out backgrounds,
+   so dark pages get lighter strokes and a stronger tint. */
+:root[${THEME_ATTR}="dark"] {
+  --vigil-high: #ff8585;
+  --vigil-high-bg: rgba(255, 133, 133, 0.22);
+  --vigil-medium: #ffab5e;
+  --vigil-medium-bg: rgba(255, 171, 94, 0.20);
+  --vigil-low: #ffd95c;
+  --vigil-low-bg: rgba(255, 217, 92, 0.18);
+}
+mark.${HIGHLIGHT_CLASS}[${HIGHLIGHT_DATA_ATTR}] {
+  /* <mark> defaults to black text in Chromium/Edge. Preserve the page's
+     foreground (and theme changes) instead of imposing a highlight color. */
+  color: inherit !important;
+  -webkit-text-fill-color: inherit !important;
   text-decoration: underline;
   text-decoration-thickness: 2px;
   text-underline-offset: 2px;
@@ -33,20 +58,71 @@ const HIGHLIGHT_CSS = `
   padding: 0 1px;
 }
 .${HIGHLIGHT_CLASS}[data-severity="high"] {
-  text-decoration-color: #e53e3e;
-  background-color: rgba(229, 62, 62, 0.10);
+  text-decoration-color: var(--vigil-high);
+  background-color: var(--vigil-high-bg);
 }
 .${HIGHLIGHT_CLASS}[data-severity="medium"] {
-  text-decoration-color: #dd6b20;
-  background-color: rgba(221, 107, 32, 0.08);
+  text-decoration-color: var(--vigil-medium);
+  background-color: var(--vigil-medium-bg);
 }
 .${HIGHLIGHT_CLASS}[data-severity="low"] {
-  text-decoration-color: #d69e2e;
-  background-color: rgba(214, 158, 46, 0.08);
+  text-decoration-color: var(--vigil-low);
+  background-color: var(--vigil-low-bg);
 }
 `;
 
+/** Perceived lightness of a CSS color, or null when it is absent or transparent. */
+function lightness(color: string): number | null {
+  const parts = color.match(/[\d.]+/g);
+  if (!parts || parts.length < 3) return null;
+  const [r, g, b, alpha = "1"] = parts.map(Number);
+  if (alpha === 0) return null;
+  return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+}
+
+/** X exposes no theme class, and its three themes do not always follow the OS
+ * setting, so the page's own background is the only reliable signal.
+ */
+function isDarkPage(): boolean {
+  for (const element of [document.body, document.documentElement]) {
+    const value = element ? lightness(getComputedStyle(element).backgroundColor) : null;
+    if (value !== null) return value < 0.5;
+  }
+  return window.matchMedia("(prefers-color-scheme: dark)").matches;
+}
+
+let themeObserver: MutationObserver | undefined;
+let themeQuery: MediaQueryList | undefined;
+
+function applyTheme(): void {
+  const theme = isDarkPage() ? "dark" : "light";
+  if (document.documentElement.getAttribute(THEME_ATTR) !== theme) {
+    document.documentElement.setAttribute(THEME_ATTR, theme);
+  }
+}
+
+function watchTheme(): void {
+  applyTheme();
+  if (themeObserver) return;
+  // Filtered to style/class so writing THEME_ATTR above cannot retrigger this.
+  themeObserver = new MutationObserver(applyTheme);
+  for (const element of [document.body, document.documentElement]) {
+    if (element) themeObserver.observe(element, { attributes: true, attributeFilter: ["style", "class"] });
+  }
+  themeQuery = window.matchMedia("(prefers-color-scheme: dark)");
+  themeQuery.addEventListener("change", applyTheme);
+}
+
+function unwatchTheme(): void {
+  themeObserver?.disconnect();
+  themeObserver = undefined;
+  themeQuery?.removeEventListener("change", applyTheme);
+  themeQuery = undefined;
+  document.documentElement.removeAttribute(THEME_ATTR);
+}
+
 function injectHighlightStyles(): void {
+  watchTheme();
   if (document.getElementById(STYLE_ID)) {
     return;
   }
@@ -58,6 +134,7 @@ function injectHighlightStyles(): void {
 
 function removeHighlightStyles(): void {
   document.getElementById(STYLE_ID)?.remove();
+  unwatchTheme();
 }
 
 let tooltipListenersBound = false;
@@ -419,7 +496,10 @@ export function highlightTweetFindings(
     const tweetText = article.querySelector('[data-testid="tweetText"]');
     if (!tweetText) continue;
 
-    const count = highlightSpansInElement(tweetText, result.findings);
+    const confirmation = result.findings.filter(f => f.pluginId === CONFIRMATION_PLUGIN_ID);
+    const ordinary = result.findings.filter(f => f.pluginId !== CONFIRMATION_PLUGIN_ID);
+    const badgeCount = article instanceof HTMLElement && addConfirmationBadge(article, result.tweetId, result.text, confirmation) ? 1 : 0;
+    const count = highlightSpansInElement(tweetText, ordinary) + badgeCount;
     if (count > 0) {
       highlightedItems++;
       totalHighlights += count;
@@ -460,6 +540,7 @@ export function highlightContentFindings(
 }
 
 export function clearAllHighlights(): void {
+  clearConfirmationBadges();
   hideGlobalTooltip();
   shadowHost?.remove();
   shadowHost = null;

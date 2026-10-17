@@ -1,3 +1,4 @@
+import "../activity/background";
 import {
   broadcastRuntimeEvent,
   isRuntimeRequestMessage,

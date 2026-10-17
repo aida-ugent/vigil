@@ -6,7 +6,7 @@ export default defineConfig({
     webExtension({
       manifest: "manifest.json",
       skipManifestValidation: true,
-      additionalInputs: ["src/offscreen/offscreen.html"],
+      additionalInputs: ["src/offscreen/offscreen.html", "src/activity/index.html"],
     }),
   ],
   build: {

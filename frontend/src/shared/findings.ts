@@ -55,6 +55,12 @@ export function findingMetaDetails(finding: Finding): Array<{ label: string; val
   if (m.protagonistRoles?.length) rows.push({ label: "Roles", value: m.protagonistRoles.join(", ") });
 
   const extra = m.extra;
+  if (Array.isArray(extra?.evidence)) {
+    for (const evidence of extra.evidence as Array<{ author?: string; url?: string }>) {
+      if (evidence.url) rows.push({ label: "Historical evidence", value: `@${evidence.author ?? "unknown"} — ${evidence.url}` });
+    }
+  }
+
   if (extra) {
     if (Array.isArray(extra.protagonists) && extra.protagonists.length > 0) {
       const formatted = (extra.protagonists as Array<{ text: string; category?: string; roles?: string[] }>)

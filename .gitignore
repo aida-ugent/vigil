@@ -28,3 +28,7 @@ tmp/
 
 # Ruff
 .ruff_cache/
+
+# Personal activity / diagnostic exports
+vigil-cb-diagnostics-*.json
+vigil-activity-*.jsonl

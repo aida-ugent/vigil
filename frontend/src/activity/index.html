@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Vigil activity</title>
+  </head>
+  <body>
+    <main>
+      <h1>Your activity</h1>
+      <p>
+        Observed activity stored in this browser. Likes are observed UI changes;
+        feed exposure does not mean endorsement.
+      </p>
+      <form id="filters">
+        <label
+          >Records
+          <select id="kind">
+            <option value="posts">X posts</option>
+            <option value="visits">Website visits</option>
+          </select></label
+        >
+        <label>Author <input id="author" placeholder="@account" /></label>
+        <label>Content <input id="query" placeholder="Keywords" /></label>
+        <button type="submit">Search</button>
+      </form>
+      <p id="status" role="status"></p>
+      <table>
+        <thead>
+          <tr>
+            <th>Date</th>
+            <th>Account / website</th>
+            <th>Content</th>
+            <th>Liked</th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+      <button id="more" type="button" hidden>Load more</button>
+      <p>
+        Account rankings, export, and deletion are available in the sidebar
+        under Activity and confirmation bias.
+      </p>
+    </main>
+    <script type="module" src="./browser.ts"></script>
+  </body>
+</html>

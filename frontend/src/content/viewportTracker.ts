@@ -84,6 +84,7 @@ export class ViewportTracker {
   private recheckTimer: ReturnType<typeof setInterval> | null = null;
   private mutationObserver: MutationObserver | null = null;
   private lastPrimaryId: string | null = null;
+  private lastVisibleKey = "";
   private observedElements = new WeakSet<Element>();
 
   constructor(callback: UpdateCallback) {
@@ -227,10 +228,12 @@ export class ViewportTracker {
 
     const primaryId = primaryEntry?.item.id ?? null;
 
-    if (primaryId === this.lastPrimaryId && visibleIds.length === this.visibleMap.size) {
+    const visibleKey = visibleIds.slice().sort().join(",");
+    if (primaryId === this.lastPrimaryId && visibleKey === this.lastVisibleKey) {
       return;
     }
     this.lastPrimaryId = primaryId;
+    this.lastVisibleKey = visibleKey;
 
     this.callback({
       visibleIds,

@@ -1,3 +1,4 @@
+import { eventSchema, type ActivityEvent } from "../activity/model";
 import { z } from "zod";
 import type {
   ExtractionErrorPayload,
@@ -28,6 +29,8 @@ export interface ProxyFetchResult {
 }
 
 export type RuntimeRequestMessage =
+  | { type: "ACTIVITY_BATCH"; payload: { events: ActivityEvent[] } }
+  | { type: "ACTIVITY_CLEAR" }
   | { type: "PING" }
   | { type: "GET_ACTIVE_TAB" }
   | { type: "CONTENT_READY"; payload: { tabId: number | null; url: string } }
@@ -123,6 +126,8 @@ type WebLLMGenerateResponse = {
 };
 
 export type RuntimeResponseMap = {
+  ACTIVITY_BATCH: { type: "ACTIVITY_ACK"; payload: { ok: boolean; error?: string } };
+  ACTIVITY_CLEAR: { type: "ACTIVITY_ACK"; payload: { ok: boolean; error?: string } };
   PING: { type: "PONG"; payload: { service: "background"; timestamp: number } };
   GET_ACTIVE_TAB: {
     type: "ACTIVE_TAB";
@@ -211,6 +216,8 @@ const payloadWith = <T extends z.ZodRawShape>(shape: T) =>
   z.object({ payload: z.object(shape).passthrough() });
 
 const runtimeRequestSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("ACTIVITY_BATCH"), payload: z.object({ events: z.array(eventSchema).max(50) }) }),
+  z.object({ type: z.literal("ACTIVITY_CLEAR") }),
   z.object({ type: z.literal("PING") }),
   z.object({ type: z.literal("GET_ACTIVE_TAB") }),
   z.object({ type: z.literal("EXTRACT_TWEETS_REQUEST") }),

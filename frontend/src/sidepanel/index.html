@@ -21,6 +21,31 @@
           Ready to analyze.
         </p>
 
+        <section class="settings-group-box" aria-label="Activity tracking">
+          <label class="field field--inline">
+            <input id="track-interactions" type="checkbox" role="switch" aria-describedby="tracking-description" />
+            <span>Track interactions</span>
+          </label>
+          <p class="meta" id="tracking-description">Store browsing activity, visible X posts (including your own), and likes to help detect confirmation bias and provide activity statistics.</p>
+          <details class="disclosure">
+            <summary class="disclosure-trigger">Activity and confirmation bias</summary>
+            <div class="disclosure-body">
+              <label class="field field--inline"><input id="confirmation-bias-enabled" type="checkbox" /><span>Use activity history for confirmation-bias detection</span></label>
+              <p class="meta">Data stays in this browser. During analysis, relevant post excerpts are sent to your selected LLM provider, including your cloud provider if configured. Pausing tracking keeps saved history.</p>
+              <p class="meta" id="activity-status" role="status">Loading activity…</p>
+              <p class="meta" id="confirmation-status" role="status"></p>
+              <button id="confirmation-diagnostics" class="btn btn-ghost btn-xs" type="button">CB diagnostics</button>
+              <div class="btn-row">
+                <button id="activity-browse" class="btn btn-ghost btn-xs" type="button">Browse activity</button>
+                <button id="activity-refresh" class="btn btn-ghost btn-xs" type="button">Refresh statistics</button>
+                <button id="activity-export" class="btn btn-ghost btn-xs" type="button">Export activity</button>
+                <button id="activity-delete" class="btn btn-ghost btn-xs" type="button">Delete activity</button>
+              </div>
+              <div id="activity-accounts" class="meta"></div>
+            </div>
+          </details>
+        </section>
+
         <!-- Currently Viewing: scroll-synced card showing the primary visible content -->
         <section class="viewing-card" id="viewing-card" aria-label="Currently viewing">
           <div class="viewing-header">
@@ -180,6 +205,7 @@
             <label class="field">
               <span class="field-label">Backend</span>
               <select id="llm-backend" class="select">
+                <option value="none">Disabled</option>
                 <option value="local-api">Local API (Ollama)</option>
                 <option value="cloud-api">Cloud API</option>
                 <option value="webllm">Browser AI (WebLLM)</option>
