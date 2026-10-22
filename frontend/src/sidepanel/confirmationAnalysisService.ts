@@ -1,9 +1,47 @@
-import { confirmationDiagnostics, type ConfirmationDiagnostics } from "../diagnostics/confirmation";
-import { getActivitySettings, tokens, preferenceText, isOwnPost } from "../activity/model";
+import {
+  confirmationDiagnostics,
+  type ConfirmationDiagnostics,
+} from "../diagnostics/confirmation";
+import {
+  getActivitySettings,
+  tokens,
+  preferenceText,
+  isOwnPost,
+  DRAIN_BATCH,
+  validEmbedding,
+} from "../activity/model";
 import { related, revision } from "../activity/database";
 import { detectConfirmationBias } from "../plugins/confirmationBias";
 import type { ContentAnalysisResult, ContentItem } from "../shared/content";
 import type { LLMService } from "../llm/types";
+import { sendRuntimeMessage } from "../shared/messages";
+
+/** Prepares a bounded batch of saved-post vectors before embedding the current text. A failure here must not
+ * block analysis, so it degrades to lexical-only retrieval; the reason is reported rather than
+ * swallowed, because a silently inert semantic pass is indistinguishable from a poor one. */
+async function queryVector(
+  text: string,
+): Promise<{ vector?: Float32Array; pending: number; error?: string }> {
+  try {
+    const response = await sendRuntimeMessage({
+      type: "ACTIVITY_EMBED",
+      payload: { query: text.slice(0, 1500), drain: DRAIN_BATCH },
+    });
+    const { ok, vector, pending, error } = response.payload;
+    if (!ok || !vector)
+      return { pending, error: error ?? "The embedder returned no vector." };
+    const normalized = Float32Array.from(vector);
+    if (!validEmbedding(normalized))
+      return { pending, error: "The embedder returned an invalid vector." };
+    return { vector: normalized, pending };
+  } catch (error) {
+    return {
+      pending: 0,
+      error:
+        error instanceof Error ? error.message : "Embedding request failed.",
+    };
+  }
+}
 
 interface AnalysisRequest {
   item: ContentItem;
@@ -32,7 +70,10 @@ export class ConfirmationAnalysisService {
   private busy = false;
   private pending: AnalysisRequest | null = null;
 
-  constructor(private readonly callbacks: AnalysisCallbacks, private readonly diagnostics: ConfirmationDiagnostics = confirmationDiagnostics) {}
+  constructor(
+    private readonly callbacks: AnalysisCallbacks,
+    private readonly diagnostics: ConfirmationDiagnostics = confirmationDiagnostics,
+  ) {}
 
   async analyze(request: AnalysisRequest): Promise<void> {
     if (!this.callbacks.isCurrent(request)) return;
@@ -42,34 +83,78 @@ export class ConfirmationAnalysisService {
     }
 
     this.busy = true;
-    const trace = this.diagnostics.begin({ id: request.item.id, text: request.item.text, pageUrl: request.item.pageUrl }, request.llm.backend, request.model);
-    const finish = (stage: "skipped" | "failed" | "discarded", reason: string) => this.diagnostics.update(trace, { stage, reason });
+    const trace = this.diagnostics.begin(
+      {
+        id: request.item.id,
+        text: request.item.text,
+        pageUrl: request.item.pageUrl,
+      },
+      request.llm.backend,
+      request.model,
+    );
+    const finish = (
+      stage: "skipped" | "failed" | "discarded",
+      reason: string,
+    ) => this.diagnostics.update(trace, { stage, reason });
     const status = (message: string): void => {
       if (this.callbacks.isCurrent(request)) this.callbacks.onStatus(message);
     };
 
     try {
-      if (!(await getActivitySettings()).confirmation) { finish("skipped", "Confirmation-bias detection is disabled."); return; }
+      if (!(await getActivitySettings()).confirmation) {
+        finish("skipped", "Confirmation-bias detection is disabled.");
+        return;
+      }
       const { item, base, llm } = request;
+      status("Preparing local semantic context…");
+      const embedding = await queryVector(item.text);
       const evidence = await related(
         item.text,
+        embedding.vector,
         item.platform === "twitter" ? item.id : undefined,
-        item.platform === "twitter" ? item.author : undefined,
       );
-      const queryTerms = tokens(item.text).slice(0, 24);
+      // Only the discriminative terms are reported: showing filler as "matching" misleads.
+      const queryTerms = evidence.queryTerms ?? tokens(item.text).slice(0, 24);
       this.diagnostics.update(trace, {
         historyRevision: evidence.revision,
-        retrieved: evidence.posts.map(p => ({ key: p.key, author: p.author, url: p.url,
-          basis: isOwnPost(p) ? (p.liked ? "authored-and-liked" : "authored") : "liked",
+        embedding: {
+          ok: !!embedding.vector,
+          pending: embedding.pending,
+          error: embedding.error,
+        },
+        retrieved: evidence.posts.map((p) => ({
+          key: p.key,
+          author: p.author,
+          url: p.url,
+          basis: isOwnPost(p)
+            ? p.liked
+              ? "authored-and-liked"
+              : "authored"
+            : "liked",
           text: preferenceText(p).slice(0, 1500),
-          retrievalMethod: evidence.retrievalMethod,
-          matchedTerms: queryTerms.filter(t => tokens(preferenceText(p)).includes(t)),
+          retrievalMethod:
+            evidence.matchMethods?.[p.key] ?? evidence.retrievalMethod,
+          similarity: evidence.similarity?.[p.key],
+          matchedTerms: queryTerms.filter((t) =>
+            tokens(preferenceText(p)).includes(t),
+          ),
         })),
       });
-      if (!this.callbacks.isCurrent(request)) { finish("discarded", "The page or analysis settings changed during retrieval."); return; }
+      if (!this.callbacks.isCurrent(request)) {
+        finish(
+          "discarded",
+          "The page or analysis settings changed during retrieval.",
+        );
+        return;
+      }
       if (!evidence.ready) {
-        finish("skipped", "Insufficient relevant history: need two distinct liked/authored posts from one known viewing account.");
-        status(`Need 2 distinct relevant liked or self-authored posts from one known viewing account; retrieved ${evidence.posts.length}.`);
+        finish(
+          "skipped",
+          "Insufficient relevant history: need two distinct liked/authored posts from one known viewing account.",
+        );
+        status(
+          `Need 2 distinct relevant liked or self-authored posts from one known viewing account; retrieved ${evidence.posts.length}.`,
+        );
         return;
       }
       if (!llm.isAvailable()) {
@@ -82,12 +167,20 @@ export class ConfirmationAnalysisService {
       const responses: Array<{ text: string; truncated: boolean }> = [];
       const validation: string[] = [];
       const findings = await detectConfirmationBias(item.text, evidence, llm, {
-        onRequest: payload => this.diagnostics.update(trace, { stage: "calling", reason: "LLM request started.", request: payload }),
-        onResponse: raw => {
-          responses.push({ text: raw.slice(0, 50000), truncated: raw.length > 50000 });
+        onRequest: (payload) =>
+          this.diagnostics.update(trace, {
+            stage: "calling",
+            reason: "LLM request started.",
+            request: payload,
+          }),
+        onResponse: (raw) => {
+          responses.push({
+            text: raw.slice(0, 50000),
+            truncated: raw.length > 50000,
+          });
           this.diagnostics.update(trace, { responses: responses.slice(-3) });
         },
-        onValidation: message => {
+        onValidation: (message) => {
           validation.push(message);
           this.diagnostics.update(trace, { validation: [...validation] });
         },
@@ -99,7 +192,10 @@ export class ConfirmationAnalysisService {
         !settings.confirmation ||
         historyRevision !== evidence.revision
       ) {
-        finish("discarded", "Result discarded because the page, settings, or activity history changed during inference.");
+        finish(
+          "discarded",
+          "Result discarded because the page, settings, or activity history changed during inference.",
+        );
         return;
       }
 
@@ -107,8 +203,15 @@ export class ConfirmationAnalysisService {
         ...base,
         findings: [...base.findings, ...findings],
       });
-      this.diagnostics.update(trace, { stage: "completed", findings,
-        reason: findings.length ? "Confirmation-bias finding returned." : validation.length ? "Response received, but findings failed validation." : "Model abstained: no supported finding returned." });
+      this.diagnostics.update(trace, {
+        stage: "completed",
+        findings,
+        reason: findings.length
+          ? "Confirmation-bias finding returned."
+          : validation.length
+            ? "Response received, but findings failed validation."
+            : "Model abstained: no supported finding returned.",
+      });
       status(
         findings.length
           ? `${findings.length} possible confirmation-bias finding(s).`
@@ -116,7 +219,10 @@ export class ConfirmationAnalysisService {
       );
     } catch (error) {
       // Provider errors may contain URLs, credentials or response bodies; do not copy them into the trace.
-      finish("failed", "Analysis failed. Inspect the response/validation details if present; otherwise check your LLM connection and configuration.");
+      finish(
+        "failed",
+        "Analysis failed. Inspect the response/validation details if present; otherwise check your LLM connection and configuration.",
+      );
       console.warn("[Vigil confirmation] Analysis failed", error);
       status(
         "Confirmation-bias analysis unavailable. Existing findings are unchanged.",

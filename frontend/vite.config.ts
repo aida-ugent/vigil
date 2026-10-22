@@ -2,11 +2,15 @@ import { defineConfig } from "vite";
 import webExtension from "vite-plugin-web-extension";
 
 export default defineConfig({
+  define: { __VIGIL_BUILD_ID__: JSON.stringify(new Date().toISOString()) },
   plugins: [
     webExtension({
       manifest: "manifest.json",
       skipManifestValidation: true,
-      additionalInputs: ["src/offscreen/offscreen.html", "src/activity/index.html"],
+      additionalInputs: [
+        "src/offscreen/offscreen.html",
+        "src/activity/index.html",
+      ],
     }),
   ],
   build: {

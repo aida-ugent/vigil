@@ -4,40 +4,74 @@ import {
   isOwnPost,
   isPreferencePost,
   preferenceText,
+  preferenceAt,
+  similarity,
+  validEmbedding,
+  hasCurrentEmbedding,
+  EMBEDDING_VERSION,
+  LEXICAL_FLOOR,
+  SIMILARITY_FLOOR,
+  IDF_MIN_CORPUS,
+  IDF_MAX_SHARE,
+  VECTOR_SCAN_LIMIT,
   type ActivityEvent,
   type StoredPost,
   type AccountStats,
   type Evidence,
+  type RetrievalMethod,
 } from "./model";
 
 let opening: Promise<IDBDatabase> | undefined;
 export function database(): Promise<IDBDatabase> {
   return (opening ??= new Promise((resolve, reject) => {
-    const req = indexedDB.open("vigil-activity", 3);
+    const req = indexedDB.open("vigil-activity", 5);
     req.onupgradeneeded = (event) => {
       const db = req.result;
       if (event.oldVersion < 1) {
-      const events = db.createObjectStore("events", { keyPath: "id" });
-      events.createIndex("at", "at");
-      events.createIndex("kind", "kind");
-      const posts = db.createObjectStore("posts", { keyPath: "key" });
-      posts.createIndex("author", "author");
-      posts.createIndex("tokens", "tokens", { multiEntry: true });
-      posts.createIndex("likedTokens", "likedTokens", { multiEntry: true });
-      db.createObjectStore("accounts", { keyPath: "key" });
-      db.createObjectStore("meta");
+        const events = db.createObjectStore("events", { keyPath: "id" });
+        events.createIndex("at", "at");
+        events.createIndex("kind", "kind");
+        const posts = db.createObjectStore("posts", { keyPath: "key" });
+        posts.createIndex("author", "author");
+        posts.createIndex("tokens", "tokens", { multiEntry: true });
+        posts.createIndex("likedTokens", "likedTokens", { multiEntry: true });
+        db.createObjectStore("accounts", { keyPath: "key" });
+        db.createObjectStore("meta");
       }
       // Existing likedAt values are indexed automatically; preserve all activity.
       const posts = req.transaction!.objectStore("posts");
-      if (event.oldVersion < 2) posts.createIndex("authorLikedAt", ["author", "likedAt"]);
-      // Refresh derived search fields after switching stopword sources; raw activity is unchanged.
-      if (event.oldVersion < 3) {
+      if (event.oldVersion < 2)
+        posts.createIndex("authorLikedAt", ["author", "likedAt"]);
+      // Sparse: IndexedDB omits records whose key path is undefined, so only preference posts are listed.
+      if (event.oldVersion < 4)
+        posts.createIndex("preferenceAt", "preferenceAt");
+      // One cursor for every derived field: concurrent cursors over the same store overwrite each
+      // other's updates, which silently dropped the refreshed tokens when both passes ran.
+      if (event.oldVersion < 5) {
         const cursor = posts.openCursor();
         cursor.onsuccess = () => {
           const entry = cursor.result;
           if (!entry) return;
           const post = entry.value as StoredPost;
-          entry.update({ ...post, tokens: tokens(post.text), likedTokens: post.liked ? tokens(post.likedText ?? post.text) : [] });
+          // Refresh derived search fields after switching stopword sources; raw activity is unchanged.
+          const refreshed: StoredPost =
+            event.oldVersion < 3
+              ? {
+                  ...post,
+                  tokens: tokens(post.text),
+                  likedTokens: post.liked
+                    ? tokens(post.likedText ?? post.text)
+                    : [],
+                }
+              : post;
+          // Only the synchronous key is backfilled here. Vectors cannot be: awaiting inference inside
+          // an upgrade transaction lets it auto-commit, so embeddings are filled by the drain instead.
+          // v5 drops vectors computed by the earlier WebGPU int8 path; the drain recomputes them on WASM.
+          entry.update({
+            ...refreshed,
+            preferenceAt: preferenceAt(refreshed),
+            embedding: undefined,
+          });
           entry.continue();
         };
       }
@@ -122,6 +156,15 @@ export async function saveEvents(events: ActivityEvent[]): Promise<void> {
           tokens: tokens(latest.text),
           likedTokens: liked ? tokens(likedText ?? post.text) : [],
         };
+        row.preferenceAt = preferenceAt(row);
+        // Keep a vector only while it still describes the text it was computed from.
+        row.embedding =
+          old &&
+          hasCurrentEmbedding(old) &&
+          preferenceText(row) === preferenceText(old)
+            ? old.embedding
+            : undefined;
+        row.embeddingVersion = row.embedding ? EMBEDDING_VERSION : undefined;
         if (isOwnPost(row) && (!old || old.text !== row.text))
           tx.objectStore("meta").put(crypto.randomUUID(), "revision");
         tx.objectStore("posts").put(row);
@@ -163,67 +206,181 @@ export async function revision(): Promise<string> {
 }
 export async function related(
   text: string,
+  queryVector?: Float32Array,
   excludeId?: string,
-  author?: string,
 ): Promise<Evidence> {
   const db = await database();
   const tx = db.transaction(["posts", "meta"]);
   const query = tokens(text).slice(0, 24);
   const store = tx.objectStore("posts");
   const revisionRequest = request(tx.objectStore("meta").get("revision"));
-  const normalizedAuthor = author?.trim().replace(/^@/, "").toLowerCase();
-  // Schedule alongside keyword reads to keep one consistent transaction snapshot.
-  const authorPosts: Promise<StoredPost[]> = normalizedAuthor
-    ? new Promise((resolve, reject) => {
-        const matches: StoredPost[] = [];
-        let scanned = 0;
-        const range = IDBKeyRange.bound([normalizedAuthor, 0], [normalizedAuthor, Number.MAX_VALUE]);
-        const cursor = store.index("authorLikedAt").openCursor(range, "prev");
-        cursor.onerror = () => reject(cursor.error);
-        cursor.onsuccess = () => {
-          const entry = cursor.result;
-          if (!entry) { resolve(matches); return; }
-          const post = entry.value as StoredPost;
-          if (post.liked && post.id !== excludeId) matches.push(post);
-          if (matches.length >= 100 || ++scanned >= 500) { resolve(matches); return; }
-          entry.continue();
-        };
-      })
-    : Promise.resolve([]);
-  const [groups, sameAuthor] = await Promise.all([Promise.all(
-    query.flatMap((term) => [
-      request(store.index("likedTokens").getAll(term, 100)),
-      request(store.index("tokens").getAll(term, 50)),
-    ]),
-  ), authorPosts]);
+  // Issued synchronously with every other read so the transaction cannot auto-commit beneath us.
+  // Counts span all stored posts, not just preference posts: a cheap proxy for term commonness.
+  const totalRequest = request(store.count());
+  const documentFrequency = query.map((term) =>
+    request(store.index("tokens").count(term)),
+  );
+  // Newest preference posts first, bounded; scheduled alongside the keyword reads for one snapshot.
+  const vectorMatches: Promise<Array<{ post: StoredPost; score: number }>> =
+    queryVector
+      ? new Promise((resolve, reject) => {
+          const matches: Array<{ post: StoredPost; score: number }> = [];
+          let scanned = 0;
+          const cursor = store.index("preferenceAt").openCursor(null, "prev");
+          cursor.onerror = () => reject(cursor.error);
+          cursor.onsuccess = () => {
+            const entry = cursor.result;
+            if (!entry) {
+              resolve(matches);
+              return;
+            }
+            const post = entry.value as StoredPost;
+            if (hasCurrentEmbedding(post) && post.id !== excludeId) {
+              const score = similarity(queryVector, post.embedding!);
+              if (score >= SIMILARITY_FLOOR) matches.push({ post, score });
+            }
+            if (++scanned >= VECTOR_SCAN_LIMIT) {
+              resolve(matches);
+              return;
+            }
+            entry.continue();
+          };
+        })
+      : Promise.resolve([]);
+  const [groups, semantic] = await Promise.all([
+    Promise.all(
+      query.flatMap((term) => [
+        request(store.index("likedTokens").getAll(term, 100)),
+        request(store.index("tokens").getAll(term, 50)),
+      ]),
+    ),
+    vectorMatches,
+  ]);
   const candidates = new Map<string, StoredPost>();
   for (const group of groups)
     for (const p of group as StoredPost[])
       if (p.id !== excludeId && isPreferencePost(p)) candidates.set(p.key, p);
-  const ranked = [...candidates.values()]
-    .map((p) => {
-      const terms = new Set(tokens(preferenceText(p)));
-      return { p, score: query.filter(t => terms.has(t)).length };
-    })
-    .filter((x) => x.score >= 2)
-    .sort((a, b) => b.score - a.score || b.p.at - a.p.at);
-  // Fallback only when no candidate meets the meaningful-keyword threshold.
-  const retrievalMethod = ranked.length ? "keywords" as const : "same-author" as const;
-  const selected = ranked.length ? ranked : sameAuthor.map(p => ({ p, score: 0 }));
-  // Never mix viewing accounts into a single inferred preference profile.
-  const viewers = new Set(
-    selected.map((x) => x.p.viewer),
+  const [total, frequencies] = await Promise.all([
+    totalRequest,
+    Promise.all(documentFrequency),
+  ]);
+  // Small corpora give unusable frequencies, so fall back to plain token overlap until there is
+  // enough history for commonness to mean anything.
+  const discriminative = query.filter(
+    (_, i) => total < IDF_MIN_CORPUS || frequencies[i] <= total * IDF_MAX_SHARE,
   );
+  const lexical = [...candidates.values()]
+    .map((post) => {
+      const terms = new Set(tokens(preferenceText(post)));
+      return { post, score: discriminative.filter((t) => terms.has(t)).length };
+    })
+    .filter((x) => x.score >= LEXICAL_FLOOR)
+    .sort((a, b) => b.score - a.score || b.post.at - a.post.at);
+  const dense = [...semantic].sort(
+    (a, b) => b.score - a.score || b.post.at - a.post.at,
+  );
+  // Only posts that cleared a retriever's own floor enter the pool, so "nothing relevant" stays
+  // expressible: neither pass backfills the other with its nearest remaining neighbours.
+  // Cosine is the primary ranking signal. Rank fusion used to let a weak semantic
+  // match outrank a much stronger one merely because it also matched keywords.
+  // Keyword-only candidates remain a fallback after the semantic candidates.
+  const selected = [
+    ...dense.map((x) => x.post),
+    ...lexical
+      .filter((x) => !dense.some((d) => d.post.key === x.post.key))
+      .map((x) => x.post),
+  ];
+  const lexicalKeys = new Set(lexical.map((x) => x.post.key));
+  const semanticKeys = new Set(dense.map((x) => x.post.key));
+  const retrievalMethod: RetrievalMethod =
+    lexical.length && dense.length
+      ? "hybrid"
+      : dense.length
+        ? "semantic"
+        : "lexical";
+  // Never mix viewing accounts into a single inferred preference profile.
+  const viewers = new Set(selected.map((p) => p.viewer));
   const viewer = [...viewers][0];
-  const scoped = selected.filter((x) => x.p.viewer === viewer);
-  const posts = scoped.slice(0, 12).map(x => x.p);
+  const posts = selected.filter((p) => p.viewer === viewer).slice(0, 12);
   return {
     revision: (await revisionRequest) ?? "empty",
     posts,
     retrievalMethod,
+    matchMethods: Object.fromEntries(
+      posts.map((post) => [
+        post.key,
+        semanticKeys.has(post.key)
+          ? lexicalKeys.has(post.key)
+            ? "hybrid"
+            : "semantic"
+          : "lexical",
+      ]),
+    ),
+    queryTerms: discriminative,
+    // Report scores even for keyword-selected posts below the semantic floor.
+    // Previously a hidden below-floor score looked identical to a missing vector.
+    similarity: Object.fromEntries(
+      posts
+        .filter((post) => queryVector && hasCurrentEmbedding(post))
+        .map((post) => [
+          post.key,
+          Number(similarity(queryVector!, post.embedding!).toFixed(4)),
+        ]),
+    ),
     ready:
       viewers.size === 1 && !viewers.has("unknown") && evidenceReady(posts),
   };
+}
+/** Preference posts still missing a vector, newest first: the drain works backwards from recent. */
+export async function pendingEmbeddings(limit: number): Promise<StoredPost[]> {
+  const store = (await database()).transaction("posts").objectStore("posts");
+  return new Promise((resolve, reject) => {
+    const rows: StoredPost[] = [];
+    let scanned = 0;
+    const cursor = store.index("preferenceAt").openCursor(null, "prev");
+    cursor.onerror = () => reject(cursor.error);
+    cursor.onsuccess = () => {
+      const entry = cursor.result;
+      if (!entry) {
+        resolve(rows);
+        return;
+      }
+      const post = entry.value as StoredPost;
+      if (!hasCurrentEmbedding(post)) rows.push(post);
+      if (rows.length >= limit || ++scanned >= VECTOR_SCAN_LIMIT) {
+        resolve(rows);
+        return;
+      }
+      entry.continue();
+    };
+  });
+}
+/** Writes vectors without touching any other field: a concurrent like must win over a stale read. */
+export async function saveEmbeddings(
+  entries: Array<{ key: string; embedding: Float32Array; text: string }>,
+): Promise<void> {
+  if (entries.some((entry) => !validEmbedding(entry.embedding)))
+    throw new Error("Invalid embedding vector.");
+  const tx = (await database()).transaction("posts", "readwrite");
+  const completed = done(tx);
+  for (const entry of entries) {
+    const get = tx.objectStore("posts").get(entry.key);
+    get.onsuccess = () => {
+      const post = get.result as StoredPost | undefined;
+      if (
+        !post ||
+        !isPreferencePost(post) ||
+        preferenceText(post) !== entry.text
+      )
+        return;
+      tx.objectStore("posts").put({
+        ...post,
+        embedding: entry.embedding,
+        embeddingVersion: EMBEDDING_VERSION,
+      });
+    };
+  }
+  await completed;
 }
 export async function activitySummary(): Promise<{
   events: number;
@@ -275,7 +432,8 @@ export async function exportActivity(): Promise<Blob> {
 }
 
 export type ActivityRow =
-  { kind: "post"; data: StoredPost } | { kind: "visit"; data: ActivityEvent };
+  | { kind: "post"; data: StoredPost }
+  | { kind: "visit"; data: ActivityEvent };
 
 export interface ActivityPage {
   rows: ActivityRow[];

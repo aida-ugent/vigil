@@ -16,7 +16,9 @@ let offscreenCreateInFlight: Promise<void> | null = null;
 
 chrome.runtime.onInstalled.addListener(() => {
   console.info("[Vigil v2] Scaffold installed.");
-  chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
+  chrome.sidePanel
+    .setPanelBehavior({ openPanelOnActionClick: true })
+    .catch(() => {});
 });
 
 // ── Helpers ──
@@ -74,10 +76,12 @@ async function ensureOffscreenDocument(): Promise<void> {
       await chrome.offscreen.createDocument({
         url: chrome.runtime.getURL(OFFSCREEN_DOCUMENT_PATH),
         reasons: [chrome.offscreen.Reason.WORKERS],
-        justification: "Run WebLLM in an offscreen document with WebGPU access.",
+        justification:
+          "Run local language-model and embedding inference outside the browsing page.",
       });
     } catch (error) {
-      const message = error instanceof Error ? error.message : "offscreen create failed";
+      const message =
+        error instanceof Error ? error.message : "offscreen create failed";
       if (!message.includes("Only a single offscreen")) throw error;
     }
   })();
@@ -93,7 +97,9 @@ async function sendOffscreenMessage(
   message: OffscreenRequestMessage,
 ): Promise<OffscreenResponseMessage> {
   await ensureOffscreenDocument();
-  return chrome.runtime.sendMessage(message) as Promise<OffscreenResponseMessage>;
+  return chrome.runtime.sendMessage(
+    message,
+  ) as Promise<OffscreenResponseMessage>;
 }
 
 // ── Tab relay helper ──
@@ -117,9 +123,10 @@ function tabRelay<TTabType extends string>(
       const tabPayload = payloadMapper
         ? payloadMapper(request)
         : (request as { payload?: unknown }).payload;
-      const tabMessage = tabPayload !== undefined
-        ? { type: tabMessageType, payload: tabPayload }
-        : { type: tabMessageType };
+      const tabMessage =
+        tabPayload !== undefined
+          ? { type: tabMessageType, payload: tabPayload }
+          : { type: tabMessageType };
       const result = await sendTabMessage(activeTab.tabId, tabMessage as never);
       sendResponse(result);
     } catch (error) {
@@ -137,7 +144,10 @@ type MessageHandler = (
   sendResponse: (response: unknown) => void,
 ) => void | Promise<void>;
 
-const HIGHLIGHT_FALLBACK = { type: "HIGHLIGHT_RESULT", payload: { highlightedItems: 0, totalHighlights: 0 } };
+const HIGHLIGHT_FALLBACK = {
+  type: "HIGHLIGHT_RESULT",
+  payload: { highlightedItems: 0, totalHighlights: 0 },
+};
 const ACK_FAIL = { type: "ACK", payload: { ok: false } };
 const REFORM_FAIL = { type: "REFORMULATION_APPLIED", payload: { ok: false } };
 
@@ -160,42 +170,111 @@ const messageHandlers: Record<string, MessageHandler> = {
   },
 
   CONTENT_READY(request, sender, sendResponse) {
-    const payload = (request as { payload: { tabId: number | null; url: string } }).payload;
+    const payload = (
+      request as { payload: { tabId: number | null; url: string } }
+    ).payload;
     const tabId = sender.tab?.id ?? payload.tabId;
     console.info("[Vigil v2] Content ready", { tabId, url: payload.url });
     sendResponse({ type: "ACK", payload: { ok: true } });
   },
 
-  EXTRACT_TWEETS_REQUEST: tabRelay(
-    "EXTRACT_TWEETS_FROM_PAGE",
-    { type: "EXTRACTION_ERROR", payload: { code: "NO_ACTIVE_TAB", message: "No active tab available for extraction." } },
-  ),
+  EXTRACT_TWEETS_REQUEST: tabRelay("EXTRACT_TWEETS_FROM_PAGE", {
+    type: "EXTRACTION_ERROR",
+    payload: {
+      code: "NO_ACTIVE_TAB",
+      message: "No active tab available for extraction.",
+    },
+  }),
 
-  EXTRACT_CONTENT_REQUEST: tabRelay(
-    "EXTRACT_CONTENT_FROM_PAGE",
-    { type: "EXTRACTION_ERROR", payload: { code: "NO_ACTIVE_TAB", message: "No active tab available for extraction." } },
-  ),
+  EXTRACT_CONTENT_REQUEST: tabRelay("EXTRACT_CONTENT_FROM_PAGE", {
+    type: "EXTRACTION_ERROR",
+    payload: {
+      code: "NO_ACTIVE_TAB",
+      message: "No active tab available for extraction.",
+    },
+  }),
 
-  HIGHLIGHT_FINDINGS_REQUEST: tabRelay("HIGHLIGHT_FINDINGS", HIGHLIGHT_FALLBACK, (r) => (r as { payload: unknown }).payload),
-  CLEAR_HIGHLIGHTS_REQUEST: tabRelay("CLEAR_HIGHLIGHTS", { type: "HIGHLIGHTS_CLEARED", payload: { ok: true } }),
-  SCROLL_TO_CONTENT_REQUEST: tabRelay("SCROLL_TO_CONTENT", ACK_FAIL, (r) => (r as { payload: unknown }).payload),
-  APPLY_REFORMULATION_REQUEST: tabRelay("APPLY_REFORMULATION", REFORM_FAIL, (r) => (r as { payload: unknown }).payload),
-  RESTORE_ORIGINAL_REQUEST: tabRelay("RESTORE_ORIGINAL", REFORM_FAIL, (r) => (r as { payload: unknown }).payload),
-  OBSCURE_CONTENT_REQUEST: tabRelay("OBSCURE_CONTENT", ACK_FAIL, (r) => (r as { payload: unknown }).payload),
-  REVEAL_CONTENT_REQUEST: tabRelay("REVEAL_CONTENT", ACK_FAIL, (r) => (r as { payload: unknown }).payload),
-  HIDE_CONTENT_REQUEST: tabRelay("HIDE_CONTENT", ACK_FAIL, (r) => (r as { payload: unknown }).payload),
-  UNHIDE_CONTENT_REQUEST: tabRelay("UNHIDE_CONTENT", ACK_FAIL, (r) => (r as { payload: unknown }).payload),
-  MARK_VERIFIED_REQUEST: tabRelay("MARK_VERIFIED", ACK_FAIL, (r) => (r as { payload: unknown }).payload),
-  MARK_ANALYZED_REQUEST: tabRelay("MARK_ANALYZED", ACK_FAIL, (r) => (r as { payload: unknown }).payload),
+  HIGHLIGHT_FINDINGS_REQUEST: tabRelay(
+    "HIGHLIGHT_FINDINGS",
+    HIGHLIGHT_FALLBACK,
+    (r) => (r as { payload: unknown }).payload,
+  ),
+  CLEAR_HIGHLIGHTS_REQUEST: tabRelay("CLEAR_HIGHLIGHTS", {
+    type: "HIGHLIGHTS_CLEARED",
+    payload: { ok: true },
+  }),
+  SCROLL_TO_CONTENT_REQUEST: tabRelay(
+    "SCROLL_TO_CONTENT",
+    ACK_FAIL,
+    (r) => (r as { payload: unknown }).payload,
+  ),
+  APPLY_REFORMULATION_REQUEST: tabRelay(
+    "APPLY_REFORMULATION",
+    REFORM_FAIL,
+    (r) => (r as { payload: unknown }).payload,
+  ),
+  RESTORE_ORIGINAL_REQUEST: tabRelay(
+    "RESTORE_ORIGINAL",
+    REFORM_FAIL,
+    (r) => (r as { payload: unknown }).payload,
+  ),
+  OBSCURE_CONTENT_REQUEST: tabRelay(
+    "OBSCURE_CONTENT",
+    ACK_FAIL,
+    (r) => (r as { payload: unknown }).payload,
+  ),
+  REVEAL_CONTENT_REQUEST: tabRelay(
+    "REVEAL_CONTENT",
+    ACK_FAIL,
+    (r) => (r as { payload: unknown }).payload,
+  ),
+  HIDE_CONTENT_REQUEST: tabRelay(
+    "HIDE_CONTENT",
+    ACK_FAIL,
+    (r) => (r as { payload: unknown }).payload,
+  ),
+  UNHIDE_CONTENT_REQUEST: tabRelay(
+    "UNHIDE_CONTENT",
+    ACK_FAIL,
+    (r) => (r as { payload: unknown }).payload,
+  ),
+  MARK_VERIFIED_REQUEST: tabRelay(
+    "MARK_VERIFIED",
+    ACK_FAIL,
+    (r) => (r as { payload: unknown }).payload,
+  ),
+  MARK_ANALYZED_REQUEST: tabRelay(
+    "MARK_ANALYZED",
+    ACK_FAIL,
+    (r) => (r as { payload: unknown }).payload,
+  ),
 
   async PROXY_FETCH(request, _sender, sendResponse) {
     try {
-      const { url, method, headers, body } = (request as { payload: { url: string; method: string; headers: Record<string, string>; body?: string } }).payload;
-      const resp = await fetch(url, { method, headers, body: body ?? undefined });
+      const { url, method, headers, body } = (
+        request as {
+          payload: {
+            url: string;
+            method: string;
+            headers: Record<string, string>;
+            body?: string;
+          };
+        }
+      ).payload;
+      const resp = await fetch(url, {
+        method,
+        headers,
+        body: body ?? undefined,
+      });
       const respBody = await resp.text();
       sendResponse({
         type: "PROXY_FETCH_RESULT",
-        payload: { ok: resp.ok, status: resp.status, statusText: resp.statusText, body: respBody },
+        payload: {
+          ok: resp.ok,
+          status: resp.status,
+          statusText: resp.statusText,
+          body: respBody,
+        },
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Network error";
@@ -209,20 +288,36 @@ const messageHandlers: Record<string, MessageHandler> = {
   async WEBLLM_INIT(request, _sender, sendResponse) {
     try {
       const { modelId } = (request as { payload: { modelId: string } }).payload;
-      const result = await sendOffscreenMessage({ type: "OFFSCREEN_WEBLLM_INIT", payload: { modelId } });
+      const result = await sendOffscreenMessage({
+        type: "OFFSCREEN_WEBLLM_INIT",
+        payload: { modelId },
+      });
       sendResponse({
         type: "WEBLLM_ACK",
         payload: result.ok ? { ok: true } : { ok: false, error: result.error },
       });
     } catch (error) {
-      const message = error instanceof Error ? error.message : "WebLLM init failed.";
-      sendResponse({ type: "WEBLLM_ACK", payload: { ok: false, error: message } });
+      const message =
+        error instanceof Error ? error.message : "WebLLM init failed.";
+      sendResponse({
+        type: "WEBLLM_ACK",
+        payload: { ok: false, error: message },
+      });
     }
   },
 
   async WEBLLM_GENERATE(request, _sender, sendResponse) {
     try {
-      const payload = (request as { payload: { systemPrompt: string; userPrompt: string; temperature?: number; maxTokens?: number } }).payload;
+      const payload = (
+        request as {
+          payload: {
+            systemPrompt: string;
+            userPrompt: string;
+            temperature?: number;
+            maxTokens?: number;
+          };
+        }
+      ).payload;
       const result = await sendOffscreenMessage({
         type: "OFFSCREEN_WEBLLM_GENERATE",
         payload: {
@@ -234,29 +329,84 @@ const messageHandlers: Record<string, MessageHandler> = {
       });
 
       if (!result.ok) {
-        sendResponse({ type: "WEBLLM_GENERATE_RESULT", payload: { ok: false, result: "", error: result.error } });
+        sendResponse({
+          type: "WEBLLM_GENERATE_RESULT",
+          payload: { ok: false, result: "", error: result.error },
+        });
         return;
       }
       sendResponse({
         type: "WEBLLM_GENERATE_RESULT",
-        payload: { ok: true, result: "result" in result ? result.result ?? "" : "" },
+        payload: {
+          ok: true,
+          result: "result" in result ? (result.result ?? "") : "",
+        },
       });
     } catch (error) {
-      const message = error instanceof Error ? error.message : "WebLLM generation failed.";
-      sendResponse({ type: "WEBLLM_GENERATE_RESULT", payload: { ok: false, result: "", error: message } });
+      const message =
+        error instanceof Error ? error.message : "WebLLM generation failed.";
+      sendResponse({
+        type: "WEBLLM_GENERATE_RESULT",
+        payload: { ok: false, result: "", error: message },
+      });
+    }
+  },
+
+  async ACTIVITY_EMBED(request, sender, sendResponse) {
+    const fail = (error: string) =>
+      sendResponse({
+        type: "ACTIVITY_EMBED_RESULT",
+        payload: { ok: false, vector: null, pending: 0, error },
+      });
+    try {
+      if (
+        sender.id !== chrome.runtime.id ||
+        sender.tab ||
+        !sender.url?.startsWith(chrome.runtime.getURL(""))
+      ) {
+        fail("Extension page required.");
+        return;
+      }
+      const payload = (
+        request as { payload: { query?: string; drain?: number } }
+      ).payload;
+      const result = await sendOffscreenMessage({
+        type: "OFFSCREEN_EMBED",
+        payload,
+      });
+      if (!result.ok) {
+        fail(result.error);
+        return;
+      }
+      sendResponse({
+        type: "ACTIVITY_EMBED_RESULT",
+        payload: {
+          ok: true,
+          vector: "vector" in result ? result.vector : null,
+          pending: "pending" in result ? result.pending : 0,
+        },
+      });
+    } catch (error) {
+      fail(error instanceof Error ? error.message : "Embedding failed.");
     }
   },
 
   async WEBLLM_UNLOAD(_request, _sender, sendResponse) {
     try {
-      const result = await sendOffscreenMessage({ type: "OFFSCREEN_WEBLLM_UNLOAD" });
+      const result = await sendOffscreenMessage({
+        type: "OFFSCREEN_WEBLLM_UNLOAD",
+      });
       sendResponse({
         type: "WEBLLM_ACK",
         payload: result.ok ? { ok: true } : { ok: false, error: result.error },
       });
     } catch (error) {
-      const message = error instanceof Error ? error.message : "WebLLM unload failed.";
-      sendResponse({ type: "WEBLLM_ACK", payload: { ok: false, error: message } });
+      const message =
+        error instanceof Error ? error.message : "WebLLM unload failed.";
+      sendResponse({
+        type: "WEBLLM_ACK",
+        payload: { ok: false, error: message },
+      });
     }
   },
 };
@@ -268,7 +418,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   // Forward VISIBLE_CONTENT_CHANGED from content script as a runtime event
   if ((message as { type?: string }).type === "VISIBLE_CONTENT_CHANGED") {
-    try { void broadcastRuntimeEvent(message); } catch { /* Sidepanel may not be open. */ }
+    try {
+      void broadcastRuntimeEvent(message);
+    } catch {
+      /* Sidepanel may not be open. */
+    }
     return;
   }
 

@@ -3,44 +3,210 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Vigil activity</title>
+    <title>Your attention · Vigil</title>
   </head>
   <body>
     <main>
-      <h1>Your activity</h1>
-      <p>
-        Observed activity stored in this browser. Likes are observed UI changes;
-        feed exposure does not mean endorsement.
-      </p>
-      <form id="filters">
+      <header class="page-header">
+        <div>
+          <a class="wordmark" href="#">◉ VIGIL <span>/ YOUR ACTIVITY</span></a>
+          <h1>Where your attention goes.</h1>
+          <p class="intro">
+            Explore the voices you see, the posts you like, and the places you
+            visit.
+          </p>
+        </div>
+        <div class="header-actions">
+          <span class="privacy-pill">● Stored on this device</span
+          ><button id="refresh" type="button">↻ Refresh</button>
+        </div>
+      </header>
+      <form id="dashboard-filters" class="filter-bar">
         <label
-          >Records
-          <select id="kind">
-            <option value="posts">X posts</option>
-            <option value="visits">Website visits</option>
+          >Time period<select id="period">
+            <option value="7">Last 7 days</option>
+            <option value="30" selected>Last 30 days</option>
+            <option value="90">Last 90 days</option>
+            <option value="all">All time</option>
+            <option value="custom">Custom range</option>
           </select></label
         >
-        <label>Author <input id="author" placeholder="@account" /></label>
-        <label>Content <input id="query" placeholder="Keywords" /></label>
-        <button type="submit">Search</button>
+        <div id="custom-dates" hidden>
+          <label>From<input id="from" type="date" /></label
+          ><label>Through<input id="to" type="date" /></label>
+        </div>
+        <label
+          >Viewing X as<select id="viewer">
+            <option value="">All observed accounts</option>
+          </select></label
+        >
+        <label
+          >X activity<select id="surface">
+            <option value="all">Across X</option>
+            <option value="home-feed">Home feed only</option>
+          </select></label
+        >
+        <label
+          >Chart size<select id="limit">
+            <option value="5">Top 5</option>
+            <option value="10" selected>Top 10</option>
+            <option value="20">Top 20</option>
+          </select></label
+        >
+        <span id="dashboard-status" class="status" role="status"
+          >Loading your activity…</span
+        >
       </form>
-      <p id="status" role="status"></p>
-      <table>
-        <thead>
-          <tr>
-            <th>Date</th>
-            <th>Account / website</th>
-            <th>Content</th>
-            <th>Liked</th>
-          </tr>
-        </thead>
-        <tbody id="rows"></tbody>
-      </table>
-      <button id="more" type="button" hidden>Load more</button>
-      <p>
-        Account rankings, export, and deletion are available in the sidebar
-        under Activity and confirmation bias.
-      </p>
+      <div id="empty" class="empty-state" hidden>
+        <h2>Your attention map starts here.</h2>
+        <p>
+          No activity matches this selection. Try another period, or enable
+          <strong>Track interactions</strong> in Vigil’s sidebar and browse X.
+          Then refresh this page.
+        </p>
+      </div>
+      <section class="metrics" aria-label="Activity overview">
+        <article>
+          <span class="eyebrow">Times seen</span
+          ><strong id="metric-seen">—</strong
+          ><small id="seen-note">Repeated views count separately</small>
+        </article>
+        <article>
+          <span class="eyebrow">Unique posts seen</span
+          ><strong id="metric-unique">—</strong
+          ><small>Distinct posts per viewing account</small>
+        </article>
+        <article>
+          <span class="eyebrow">Posts liked</span
+          ><strong id="metric-liked">—</strong
+          ><small id="liked-note">Unique posts liked in this period</small>
+        </article>
+        <article>
+          <span class="eyebrow">Website visits</span
+          ><strong id="metric-visits">—</strong
+          ><small>Across this browser, regardless of X account</small>
+        </article>
+      </section>
+      <section class="chart-grid" aria-label="Account comparisons">
+        <article class="card">
+          <div class="card-heading">
+            <div>
+              <span class="eyebrow">EXPOSURE</span>
+              <h2>Whose posts you see</h2>
+            </div>
+            <label class="compact-label"
+              >Measure<select id="seen-measure">
+                <option value="exposures">Times seen</option>
+                <option value="uniqueSeen">Unique posts</option>
+              </select></label
+            >
+          </div>
+          <p class="hint">
+            Select an account to explore the posts behind the numbers.
+          </p>
+          <div id="seen-chart" class="bars"></div>
+        </article>
+        <article class="card">
+          <div class="card-heading">
+            <div>
+              <span class="eyebrow">INTERACTION</span>
+              <h2>Whose posts you like</h2>
+            </div>
+            <span class="legend-dot amber">Unique posts</span>
+          </div>
+          <p class="hint">
+            Posts you liked during this period, even if later unliked.
+          </p>
+          <div id="liked-chart" class="bars amber-bars"></div>
+        </article>
+      </section>
+      <section class="card timeline-card">
+        <div class="card-heading">
+          <div>
+            <span class="eyebrow">OVER TIME</span>
+            <h2>Your daily activity</h2>
+          </div>
+          <div class="legend">
+            <span class="legend-dot">Times seen</span
+            ><span class="legend-dot amber">Like actions</span>
+          </div>
+        </div>
+        <p class="hint">
+          Both series share the same scale. Select a day to inspect its records.
+          Dates use your local timezone.
+        </p>
+        <div
+          id="timeline"
+          class="timeline"
+          role="group"
+          aria-label="Daily exposures and like actions"
+        ></div>
+        <p id="timeline-note" class="hint"></p>
+      </section>
+      <section class="card">
+        <div class="card-heading">
+          <div>
+            <span class="eyebrow">BEYOND THE FEED</span>
+            <h2>Websites you visit</h2>
+          </div>
+          <span class="hint">Date filter applies · all browser visits</span>
+        </div>
+        <div id="domain-chart" class="bars domain-bars"></div>
+      </section>
+      <section id="records" class="card records-card">
+        <div class="card-heading">
+          <div>
+            <span class="eyebrow">LOOK CLOSER</span>
+            <h2>Explore your activity</h2>
+          </div>
+          <button id="clear-selection" type="button" hidden>
+            Clear chart selection
+          </button>
+        </div>
+        <p id="selection" class="selection">
+          Showing all records in this period.
+        </p>
+        <form id="record-filters" class="record-filters">
+          <label
+            >Record type<select id="kind">
+              <option value="all">All activity</option>
+              <option value="exposure">Post exposures</option>
+              <option value="like">Like actions</option>
+              <option value="unlike">Unlike actions</option>
+              <option value="visit">Website visits</option>
+            </select></label
+          ><label>Author<input id="author" placeholder="@account" /></label
+          ><label class="search-label"
+            >Search text<input
+              id="query"
+              type="search"
+              placeholder="Search saved text or URLs…" /></label
+          ><button type="submit">Search</button>
+        </form>
+        <p id="status" class="status" role="status"></p>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>When</th>
+                <th>Activity</th>
+                <th>Account / website</th>
+                <th>Saved content</th>
+                <th>Viewing as</th>
+              </tr>
+            </thead>
+            <tbody id="rows"></tbody>
+          </table>
+        </div>
+        <button id="more" type="button" hidden>Load more records</button>
+      </section>
+      <footer>
+        These are observed interactions, not a complete X history. Exposure does
+        not mean endorsement; a like does not establish a belief. <br />Like
+        actions can be repeated; “posts liked” counts each post once per viewing
+        account in the selected period. Export and deletion are available in the
+        Vigil sidebar.
+      </footer>
     </main>
     <script type="module" src="./browser.ts"></script>
   </body>

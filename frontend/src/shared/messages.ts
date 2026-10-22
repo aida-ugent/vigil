@@ -36,17 +36,26 @@ export type RuntimeRequestMessage =
   | { type: "CONTENT_READY"; payload: { tabId: number | null; url: string } }
   | { type: "EXTRACT_TWEETS_REQUEST" }
   | { type: "EXTRACT_CONTENT_REQUEST" }
-  | { type: "HIGHLIGHT_FINDINGS_REQUEST"; payload: { results: ContentAnalysisResult[] } }
+  | {
+      type: "HIGHLIGHT_FINDINGS_REQUEST";
+      payload: { results: ContentAnalysisResult[] };
+    }
   | { type: "CLEAR_HIGHLIGHTS_REQUEST" }
   | { type: "SCROLL_TO_CONTENT_REQUEST"; payload: { contentId: string } }
   | { type: "APPLY_REFORMULATION_REQUEST"; payload: ApplyReformulationPayload }
   | { type: "RESTORE_ORIGINAL_REQUEST"; payload: { contentId: string } }
   | { type: "OBSCURE_CONTENT_REQUEST"; payload: { contentId: string } }
   | { type: "REVEAL_CONTENT_REQUEST"; payload: { contentId: string } }
-  | { type: "HIDE_CONTENT_REQUEST"; payload: { contentId: string; text: string } }
+  | {
+      type: "HIDE_CONTENT_REQUEST";
+      payload: { contentId: string; text: string };
+    }
   | { type: "UNHIDE_CONTENT_REQUEST"; payload: { contentId: string } }
   | { type: "MARK_VERIFIED_REQUEST"; payload: { contentId: string } }
-  | { type: "MARK_ANALYZED_REQUEST"; payload: { contentId: string; count: number } }
+  | {
+      type: "MARK_ANALYZED_REQUEST";
+      payload: { contentId: string; count: number };
+    }
   | { type: "PROXY_FETCH"; payload: ProxyFetchPayload }
   | { type: "WEBLLM_INIT"; payload: { modelId: string } }
   | {
@@ -58,7 +67,8 @@ export type RuntimeRequestMessage =
         maxTokens?: number;
       };
     }
-  | { type: "WEBLLM_UNLOAD" };
+  | { type: "WEBLLM_UNLOAD" }
+  | { type: "ACTIVITY_EMBED"; payload: { query?: string; drain?: number } };
 
 /**
  * Runtime events broadcast from background to listeners (e.g., sidepanel).
@@ -103,7 +113,10 @@ export type TabRequestMessage =
   | { type: "CONTENT_PING" }
   | { type: "EXTRACT_TWEETS_FROM_PAGE" }
   | { type: "EXTRACT_CONTENT_FROM_PAGE" }
-  | { type: "HIGHLIGHT_FINDINGS"; payload: { results: ContentAnalysisResult[] } }
+  | {
+      type: "HIGHLIGHT_FINDINGS";
+      payload: { results: ContentAnalysisResult[] };
+    }
   | { type: "CLEAR_HIGHLIGHTS" }
   | { type: "SCROLL_TO_CONTENT"; payload: { contentId: string } }
   | { type: "APPLY_REFORMULATION"; payload: ApplyReformulationPayload }
@@ -115,7 +128,10 @@ export type TabRequestMessage =
 
 type AckResponse = { type: "ACK"; payload: { ok: true } };
 type HighlightResponse = { type: "HIGHLIGHT_RESULT"; payload: HighlightResult };
-type HighlightsClearedResponse = { type: "HIGHLIGHTS_CLEARED"; payload: { ok: true } };
+type HighlightsClearedResponse = {
+  type: "HIGHLIGHTS_CLEARED";
+  payload: { ok: true };
+};
 type WebLLMAckResponse = {
   type: "WEBLLM_ACK";
   payload: { ok: boolean; error?: string };
@@ -126,8 +142,14 @@ type WebLLMGenerateResponse = {
 };
 
 export type RuntimeResponseMap = {
-  ACTIVITY_BATCH: { type: "ACTIVITY_ACK"; payload: { ok: boolean; error?: string } };
-  ACTIVITY_CLEAR: { type: "ACTIVITY_ACK"; payload: { ok: boolean; error?: string } };
+  ACTIVITY_BATCH: {
+    type: "ACTIVITY_ACK";
+    payload: { ok: boolean; error?: string };
+  };
+  ACTIVITY_CLEAR: {
+    type: "ACTIVITY_ACK";
+    payload: { ok: boolean; error?: string };
+  };
   PING: { type: "PONG"; payload: { service: "background"; timestamp: number } };
   GET_ACTIVE_TAB: {
     type: "ACTIVE_TAB";
@@ -155,9 +177,21 @@ export type RuntimeResponseMap = {
   WEBLLM_INIT: WebLLMAckResponse;
   WEBLLM_GENERATE: WebLLMGenerateResponse;
   WEBLLM_UNLOAD: WebLLMAckResponse;
+  ACTIVITY_EMBED: {
+    type: "ACTIVITY_EMBED_RESULT";
+    payload: {
+      ok: boolean;
+      vector: number[] | null;
+      pending: number;
+      error?: string;
+    };
+  };
 };
 
-type ReformulationAppliedResponse = { type: "REFORMULATION_APPLIED"; payload: { ok: boolean } };
+type ReformulationAppliedResponse = {
+  type: "REFORMULATION_APPLIED";
+  payload: { ok: boolean };
+};
 
 export type TabResponseMap = {
   CONTENT_PING: { type: "CONTENT_PONG"; payload: { ready: true } };
@@ -188,7 +222,9 @@ export type RuntimeEventType = RuntimeEventMessage["type"];
 export async function sendRuntimeMessage<TType extends RuntimeRequestType>(
   message: Extract<RuntimeRequestMessage, { type: TType }>,
 ): Promise<RuntimeResponseMap[TType]> {
-  return chrome.runtime.sendMessage(message) as Promise<RuntimeResponseMap[TType]>;
+  return chrome.runtime.sendMessage(message) as Promise<
+    RuntimeResponseMap[TType]
+  >;
 }
 
 /**
@@ -198,7 +234,9 @@ export async function sendTabMessage<TType extends TabRequestType>(
   tabId: number,
   message: Extract<TabRequestMessage, { type: TType }>,
 ): Promise<TabResponseMap[TType]> {
-  return chrome.tabs.sendMessage(tabId, message) as Promise<TabResponseMap[TType]>;
+  return chrome.tabs.sendMessage(tabId, message) as Promise<
+    TabResponseMap[TType]
+  >;
 }
 
 /**
@@ -216,7 +254,10 @@ const payloadWith = <T extends z.ZodRawShape>(shape: T) =>
   z.object({ payload: z.object(shape).passthrough() });
 
 const runtimeRequestSchema = z.discriminatedUnion("type", [
-  z.object({ type: z.literal("ACTIVITY_BATCH"), payload: z.object({ events: z.array(eventSchema).max(50) }) }),
+  z.object({
+    type: z.literal("ACTIVITY_BATCH"),
+    payload: z.object({ events: z.array(eventSchema).max(50) }),
+  }),
   z.object({ type: z.literal("ACTIVITY_CLEAR") }),
   z.object({ type: z.literal("PING") }),
   z.object({ type: z.literal("GET_ACTIVE_TAB") }),
@@ -224,29 +265,77 @@ const runtimeRequestSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("EXTRACT_CONTENT_REQUEST") }),
   z.object({ type: z.literal("CLEAR_HIGHLIGHTS_REQUEST") }),
   z.object({ type: z.literal("WEBLLM_UNLOAD") }),
-  z.object({ type: z.literal("PROXY_FETCH") }).merge(payloadWith({ url: z.string(), method: z.string() })),
-  z.object({ type: z.literal("CONTENT_READY") }).merge(payloadWith({ url: z.string() })),
-  z.object({ type: z.literal("HIGHLIGHT_FINDINGS_REQUEST") }).merge(payloadWith({ results: z.array(z.any()) })),
-  z.object({ type: z.literal("SCROLL_TO_CONTENT_REQUEST") }).merge(payloadWith({ contentId: z.string() })),
-  z.object({ type: z.literal("APPLY_REFORMULATION_REQUEST") }).merge(payloadWith({ contentId: z.string(), reformulatedText: z.string() })),
-  z.object({ type: z.literal("RESTORE_ORIGINAL_REQUEST") }).merge(payloadWith({ contentId: z.string() })),
-  z.object({ type: z.literal("OBSCURE_CONTENT_REQUEST") }).merge(payloadWith({ contentId: z.string() })),
-  z.object({ type: z.literal("REVEAL_CONTENT_REQUEST") }).merge(payloadWith({ contentId: z.string() })),
-  z.object({ type: z.literal("HIDE_CONTENT_REQUEST") }).merge(payloadWith({ contentId: z.string(), text: z.string() })),
-  z.object({ type: z.literal("UNHIDE_CONTENT_REQUEST") }).merge(payloadWith({ contentId: z.string() })),
-  z.object({ type: z.literal("MARK_VERIFIED_REQUEST") }).merge(payloadWith({ contentId: z.string() })),
-  z.object({ type: z.literal("MARK_ANALYZED_REQUEST") }).merge(payloadWith({ contentId: z.string(), count: z.number() })),
-  z.object({ type: z.literal("WEBLLM_INIT") }).merge(payloadWith({ modelId: z.string() })),
-  z.object({ type: z.literal("WEBLLM_GENERATE") }).merge(payloadWith({ systemPrompt: z.string(), userPrompt: z.string() })),
+  z
+    .object({ type: z.literal("PROXY_FETCH") })
+    .merge(payloadWith({ url: z.string(), method: z.string() })),
+  z
+    .object({ type: z.literal("CONTENT_READY") })
+    .merge(payloadWith({ url: z.string() })),
+  z
+    .object({ type: z.literal("HIGHLIGHT_FINDINGS_REQUEST") })
+    .merge(payloadWith({ results: z.array(z.any()) })),
+  z
+    .object({ type: z.literal("SCROLL_TO_CONTENT_REQUEST") })
+    .merge(payloadWith({ contentId: z.string() })),
+  z
+    .object({ type: z.literal("APPLY_REFORMULATION_REQUEST") })
+    .merge(
+      payloadWith({ contentId: z.string(), reformulatedText: z.string() }),
+    ),
+  z
+    .object({ type: z.literal("RESTORE_ORIGINAL_REQUEST") })
+    .merge(payloadWith({ contentId: z.string() })),
+  z
+    .object({ type: z.literal("OBSCURE_CONTENT_REQUEST") })
+    .merge(payloadWith({ contentId: z.string() })),
+  z
+    .object({ type: z.literal("REVEAL_CONTENT_REQUEST") })
+    .merge(payloadWith({ contentId: z.string() })),
+  z
+    .object({ type: z.literal("HIDE_CONTENT_REQUEST") })
+    .merge(payloadWith({ contentId: z.string(), text: z.string() })),
+  z
+    .object({ type: z.literal("UNHIDE_CONTENT_REQUEST") })
+    .merge(payloadWith({ contentId: z.string() })),
+  z
+    .object({ type: z.literal("MARK_VERIFIED_REQUEST") })
+    .merge(payloadWith({ contentId: z.string() })),
+  z
+    .object({ type: z.literal("MARK_ANALYZED_REQUEST") })
+    .merge(payloadWith({ contentId: z.string(), count: z.number() })),
+  z
+    .object({ type: z.literal("WEBLLM_INIT") })
+    .merge(payloadWith({ modelId: z.string() })),
+  z
+    .object({ type: z.literal("WEBLLM_GENERATE") })
+    .merge(payloadWith({ systemPrompt: z.string(), userPrompt: z.string() })),
+  z.object({ type: z.literal("ACTIVITY_EMBED") }).merge(
+    payloadWith({
+      query: z.string().max(1500).optional(),
+      drain: z.number().int().min(1).max(32).optional(),
+    }),
+  ),
 ]);
 
 const runtimeEventSchema = z.discriminatedUnion("type", [
-  z.object({ type: z.literal("TAB_NAVIGATED") }).merge(payloadWith({ tabId: z.number(), url: z.string() })),
-  z.object({ type: z.literal("VISIBLE_CONTENT_CHANGED") }).merge(payloadWith({ visibleIds: z.array(z.any()), platform: z.string() })),
-  z.object({ type: z.literal("WEBLLM_PROGRESS") }).merge(payloadWith({ progress: z.number(), text: z.string() })),
-  z.object({ type: z.literal("WEBLLM_READY") }).merge(payloadWith({ modelId: z.string() })),
-  z.object({ type: z.literal("WEBLLM_ERROR") }).merge(payloadWith({ error: z.string() })),
-  z.object({ type: z.literal("WEBLLM_RESULT") }).merge(payloadWith({ result: z.string() })),
+  z
+    .object({ type: z.literal("TAB_NAVIGATED") })
+    .merge(payloadWith({ tabId: z.number(), url: z.string() })),
+  z
+    .object({ type: z.literal("VISIBLE_CONTENT_CHANGED") })
+    .merge(payloadWith({ visibleIds: z.array(z.any()), platform: z.string() })),
+  z
+    .object({ type: z.literal("WEBLLM_PROGRESS") })
+    .merge(payloadWith({ progress: z.number(), text: z.string() })),
+  z
+    .object({ type: z.literal("WEBLLM_READY") })
+    .merge(payloadWith({ modelId: z.string() })),
+  z
+    .object({ type: z.literal("WEBLLM_ERROR") })
+    .merge(payloadWith({ error: z.string() })),
+  z
+    .object({ type: z.literal("WEBLLM_RESULT") })
+    .merge(payloadWith({ result: z.string() })),
 ]);
 
 /**

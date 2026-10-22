@@ -1,4 +1,8 @@
 import * as webllm from "@mlc-ai/web-llm";
+import { drain, embed } from "../activity/embedding";
+import { EmbeddingBackfill } from "../activity/backfill";
+import { getActivitySettings } from "../activity/model";
+import { prepareEmbedding } from "../activity/embeddingRequest";
 import type { RuntimeEventMessage } from "../shared/messages";
 import {
   isOffscreenRequestMessage,
@@ -67,7 +71,8 @@ async function initModel(modelId: string): Promise<void> {
   sendProgress(0.03, "Starting WebLLM engine...");
   engine = await webllm.CreateMLCEngine(modelId, {
     initProgressCallback(report) {
-      const progress = typeof report.progress === "number" ? report.progress : 0;
+      const progress =
+        typeof report.progress === "number" ? report.progress : 0;
       let text = report.text || "Loading model...";
       if (text.includes("Loading model")) {
         text = "Loading model weights...";
@@ -84,6 +89,24 @@ async function initModel(modelId: string): Promise<void> {
   sendProgress(1, "Model ready");
   sendReady(modelId);
 }
+
+let inference: Promise<unknown> = Promise.resolve();
+let queuedInference = 0;
+/** Serialize model operations; background batches yield to interactive requests. */
+function queueInference<T>(work: () => Promise<T>): Promise<T> {
+  queuedInference++;
+  const next = inference.then(work, work).finally(() => {
+    queuedInference--;
+  });
+  inference = next.catch(() => {});
+  return next;
+}
+
+const backfill = new EmbeddingBackfill(
+  () => queueInference(() => drain(8)),
+  () => queuedInference > 0,
+  async () => (await getActivitySettings()).confirmation,
+);
 
 async function generate(
   systemPrompt: string,
@@ -128,17 +151,19 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   void (async () => {
     try {
       if (request.type === "OFFSCREEN_WEBLLM_INIT") {
-        await initModel(request.payload.modelId);
+        await queueInference(() => initModel(request.payload.modelId));
         sendSafeResponse(sendResponse, { ok: true });
         return;
       }
 
       if (request.type === "OFFSCREEN_WEBLLM_GENERATE") {
-        const result = await generate(
-          request.payload.systemPrompt,
-          request.payload.userPrompt,
-          request.payload.temperature,
-          request.payload.maxTokens,
+        const result = await queueInference(() =>
+          generate(
+            request.payload.systemPrompt,
+            request.payload.userPrompt,
+            request.payload.temperature,
+            request.payload.maxTokens,
+          ),
         );
         sendResult(result);
         sendSafeResponse(sendResponse, { ok: true, result });
@@ -146,13 +171,23 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       }
 
       if (request.type === "OFFSCREEN_WEBLLM_UNLOAD") {
-        await unloadModel();
+        await queueInference(unloadModel);
         sendSafeResponse(sendResponse, { ok: true });
+        return;
+      }
+
+      if (request.type === "OFFSCREEN_EMBED") {
+        const { query, drain: limit } = request.payload;
+        const result = await queueInference(() =>
+          prepareEmbedding({ query, drain: limit }, { drain, embed }),
+        );
+        sendSafeResponse(sendResponse, { ok: true, ...result });
+        if (result.pending > 0) backfill.start();
       }
     } catch (error) {
       const message =
         error instanceof Error ? error.message : "WebLLM operation failed.";
-      sendError(message);
+      if (request.type !== "OFFSCREEN_EMBED") sendError(message);
       sendSafeResponse(sendResponse, { ok: false, error: message });
     }
   })();
