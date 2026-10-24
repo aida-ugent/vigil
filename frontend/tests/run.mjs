@@ -10,9 +10,11 @@ await build({
   format: "cjs",
   packages: "external",
 });
+// Run the bundle directly: `node --test <path>` treats the path as a glob,
+// which skips dot-directories such as node_modules/.cache on Node 22+.
 const result = spawnSync(
   process.execPath,
-  ["--test", "node_modules/.cache/vigil-activity-tests.cjs"],
+  ["node_modules/.cache/vigil-activity-tests.cjs"],
   { stdio: "inherit" },
 );
 process.exitCode = result.status ?? 1;

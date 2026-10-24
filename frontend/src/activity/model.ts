@@ -5,12 +5,15 @@ export const ACTIVITY_SETTINGS_KEY = "vigilActivitySettingsV1";
 export interface ActivitySettings {
   tracking: boolean;
 }
+export function isTrackingEnabled(stored: unknown): boolean {
+  return (stored as Partial<ActivitySettings> | undefined)?.tracking === true;
+}
 export async function getActivitySettings(): Promise<ActivitySettings> {
   const raw = (await chrome.storage.local.get(ACTIVITY_SETTINGS_KEY))[
     ACTIVITY_SETTINGS_KEY
   ];
   return {
-    tracking: raw?.tracking === true,
+    tracking: isTrackingEnabled(raw),
   };
 }
 export async function setActivitySettings(

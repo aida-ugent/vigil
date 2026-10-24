@@ -5,6 +5,7 @@ import {
 } from "../shared/messages";
 import {
   getActivitySettings,
+  isTrackingEnabled,
   cleanUrl,
   ACTIVITY_SETTINGS_KEY,
   type ActivityEvent,
@@ -111,8 +112,8 @@ chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
 chrome.storage.onChanged.addListener((changes, area) => {
   if (
     area !== "local" ||
-    changes[ACTIVITY_SETTINGS_KEY]?.newValue?.tracking !== true ||
-    changes[ACTIVITY_SETTINGS_KEY]?.oldValue?.tracking === true
+    !isTrackingEnabled(changes[ACTIVITY_SETTINGS_KEY]?.newValue) ||
+    isTrackingEnabled(changes[ACTIVITY_SETTINGS_KEY]?.oldValue)
   )
     return;
   void chrome.tabs

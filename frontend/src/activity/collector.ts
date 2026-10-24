@@ -2,6 +2,7 @@ import { sendRuntimeMessage } from "../shared/messages";
 import {
   ACTIVITY_SETTINGS_KEY,
   getActivitySettings,
+  isTrackingEnabled,
   cleanUrl,
   type ActivityEvent,
   type PostSnapshot,
@@ -298,7 +299,7 @@ export function startActivityCollection(): void {
   }
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area === "local" && changes[ACTIVITY_SETTINGS_KEY])
-      configure(changes[ACTIVITY_SETTINGS_KEY].newValue?.tracking === true);
+      configure(isTrackingEnabled(changes[ACTIVITY_SETTINGS_KEY].newValue));
   });
   void getActivitySettings()
     .then((s) => configure(s.tracking))

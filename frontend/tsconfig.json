@@ -6,7 +6,7 @@
     "strict": true,
     "noEmit": true,
     "lib": ["ES2022", "DOM"],
-    "types": ["chrome"],
+    "types": ["chrome", "vite/client"],
     "resolveJsonModule": true,
     "skipLibCheck": true
   },
