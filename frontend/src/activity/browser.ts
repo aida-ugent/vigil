@@ -126,7 +126,7 @@ function renderTimeline() {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "day-column";
-    button.title = `${date}: ${metric.exposures} times seen, ${metric.likeActions} like actions`;
+    button.title = `${date}: ${metric.exposures} times seen, ${metric.likeActions} saved likes`;
     button.setAttribute("aria-label", button.title + ". Show records.");
     const bars = document.createElement("span");
     bars.className = "day-bars";
@@ -311,11 +311,10 @@ async function refresh() {
     ] as const)
       el(`metric-${id}`).textContent = count.toLocaleString();
     el("liked-note").textContent =
-      `${result.likeActions.toLocaleString()} like actions · ${result.unlikeActions.toLocaleString()} unlike actions`;
+      `${result.likeActions.toLocaleString()} saved likes · unliked posts are removed`;
     el("empty").hidden = !!(
       result.exposures ||
       result.likeActions ||
-      result.unlikeActions ||
       result.visits
     );
     renderCharts();

@@ -25,7 +25,7 @@ import {
 let opening: Promise<IDBDatabase> | undefined;
 export function database(): Promise<IDBDatabase> {
   return (opening ??= new Promise((resolve, reject) => {
-    const req = indexedDB.open("vigil-activity", 6);
+    const req = indexedDB.open("vigil-activity", 7);
     req.onupgradeneeded = (event) => {
       const db = req.result;
       if (event.oldVersion < 1) {
@@ -47,6 +47,16 @@ export function database(): Promise<IDBDatabase> {
         req
           .transaction!.objectStore("posts")
           .createIndex("embeddingVersion", "embeddingVersion");
+      }
+      if (event.oldVersion < 7) {
+        const events = req.transaction!.objectStore("events");
+        events.createIndex("postKindAt", [
+          "post.viewer",
+          "post.id",
+          "kind",
+          "at",
+        ]);
+        events.createIndex("textKey", "textKey");
       }
       // Existing likedAt values are indexed automatically; preserve all activity.
       const posts = req.transaction!.objectStore("posts");
@@ -113,11 +123,49 @@ function done(tx: IDBTransaction): Promise<void> {
     tx.onerror = () => reject(tx.error);
   });
 }
+/** Remove saved preferences up to an interaction time, preserving newer re-likes. */
+function removePreferenceEvents(
+  tx: IDBTransaction,
+  viewer: string,
+  id: string,
+  at: number,
+  garbage: Set<string>,
+  finished: () => void,
+): void {
+  const kinds = ["like", "unlike"];
+  function scan(): void {
+    const kind = kinds.shift();
+    if (!kind) {
+      finished();
+      return;
+    }
+    const req = tx
+      .objectStore("events")
+      .index("postKindAt")
+      .openCursor(
+        IDBKeyRange.bound([viewer, id, kind, 0], [viewer, id, kind, at]),
+      );
+    req.onsuccess = () => {
+      const cursor = req.result;
+      if (!cursor) {
+        scan();
+        return;
+      }
+      if (cursor.value.textKey) garbage.add(cursor.value.textKey);
+      cursor.delete();
+      cursor.continue();
+    };
+  }
+  scan();
+}
+
 export async function saveEvents(events: ActivityEvent[]): Promise<void> {
-  // Hash before opening the transaction: asynchronous hashing would let IDB auto-commit.
+  // Unlike is a deletion command, not an event to persist or embed.
   const keys = await Promise.all(
     events.map((event) =>
-      event.post ? snapshotKey(event.post.text) : undefined,
+      event.post && event.kind !== "unlike"
+        ? snapshotKey(event.post.text)
+        : undefined,
     ),
   );
   const tx = (await database()).transaction(
@@ -125,86 +173,158 @@ export async function saveEvents(events: ActivityEvent[]): Promise<void> {
     "readwrite",
   );
   const completed = done(tx);
-  // All dependent operations stay in IDB callbacks so the transaction remains active.
+  const garbage = new Set<string>();
   let position = 0;
   function next(): void {
     const event = events[position++];
-    if (!event) return;
+    if (!event) {
+      // Check references only after all commands, including re-likes, have been applied.
+      for (const key of garbage) {
+        const req = tx.objectStore("events").index("textKey").count(key);
+        req.onsuccess = () => {
+          if (!req.result) tx.objectStore("texts").delete(key);
+        };
+      }
+      return;
+    }
+    const textKey = keys[position - 1];
     const exists = tx.objectStore("events").get(event.id);
     exists.onsuccess = () => {
-      if (exists.result) {
-        next();
-        return;
-      }
-      tx.objectStore("events").put(
-        storeSnapshot(tx, event, keys[position - 1]),
-      );
-      if (event.kind === "like" || event.kind === "unlike")
-        tx.objectStore("meta").put(crypto.randomUUID(), "revision");
-      if (!event.post) {
+      if (exists.result && event.kind !== "unlike") {
         next();
         return;
       }
       const post = event.post;
+      if (!post) {
+        if (event.kind !== "unlike") tx.objectStore("events").put(event);
+        else tx.objectStore("events").delete(event.id);
+        next();
+        return;
+      }
       const key = `${post.viewer}:${post.id}`;
       const get = tx.objectStore("posts").get(key);
       get.onsuccess = () => {
         const old = get.result as StoredPost | undefined;
-        const newer = !old || event.at >= (old.interactionAt ?? 0);
-        const liked =
-          newer && event.kind === "like"
-            ? true
-            : newer && event.kind === "unlike"
-              ? false
-              : (old?.liked ?? false);
-        const likedText =
-          newer && event.kind === "like" ? post.text : old?.likedText;
-        const latest = old && old.at > event.at ? old : post;
-        const row: StoredPost = {
-          ...latest,
-          key,
-          at: Math.max(event.at, old?.at ?? 0),
-          liked,
-          interactionAt:
-            newer && (event.kind === "like" || event.kind === "unlike")
-              ? event.at
-              : old?.interactionAt,
-          likedAt: newer && event.kind === "like" ? event.at : old?.likedAt,
-          likedText,
-          tokens: tokens(latest.text),
-          likedTokens: liked ? tokens(likedText ?? post.text) : [],
-        };
-        row.preferenceAt = preferenceAt(row);
-        // Keep a vector only while it still describes the text it was computed from.
-        row.embedding =
-          old &&
-          hasCurrentEmbedding(old) &&
-          preferenceText(row) === preferenceText(old)
-            ? old.embedding
-            : undefined;
-        row.embeddingVersion = row.embedding ? EMBEDDING_VERSION : undefined;
-        if (isOwnPost(row) && (!old || old.text !== row.text))
-          tx.objectStore("meta").put(crypto.randomUUID(), "revision");
-        tx.objectStore("posts").put(row);
-        const accountKey = `${post.viewer}:${post.author}`;
-        const accountReq = tx.objectStore("accounts").get(accountKey);
-        accountReq.onsuccess = () => {
-          const account: AccountStats = accountReq.result ?? {
-            key: accountKey,
-            author: post.author,
-            viewer: post.viewer,
-            exposures: 0,
-            feedExposures: 0,
-            likes: 0,
+        // Only an ordering timestamp is kept after deletion, so delayed retries cannot
+        // resurrect a removed like. No unlike event, text, or snapshot is retained.
+        const ordering = tx.objectStore("meta").get(`lastUnlike:${key}`);
+        ordering.onsuccess = () => {
+          const newer =
+            event.at >=
+              Math.max(old?.interactionAt ?? 0, ordering.result ?? 0) &&
+            (event.kind !== "like" ||
+              ordering.result === undefined ||
+              event.at > ordering.result);
+          const apply = () => {
+            if (!newer && event.kind !== "exposure") {
+              next();
+              return;
+            }
+            if (event.kind !== "unlike")
+              tx.objectStore("events").put(storeSnapshot(tx, event, textKey));
+            if (event.kind === "like" || event.kind === "unlike")
+              tx.objectStore("meta").put(crypto.randomUUID(), "revision");
+            if (event.kind === "unlike")
+              tx.objectStore("meta").put(event.at, `lastUnlike:${key}`);
+            const liked =
+              event.kind === "like"
+                ? true
+                : event.kind === "unlike"
+                  ? false
+                  : (old?.liked ?? false);
+            const latest =
+              event.kind === "unlike" && old
+                ? old
+                : old && old.at > event.at
+                  ? old
+                  : post;
+            const likedText =
+              event.kind === "unlike"
+                ? undefined
+                : event.kind === "like"
+                  ? post.text
+                  : old?.likedText;
+            const row: StoredPost = {
+              ...latest,
+              key,
+              at: Math.max(event.at, old?.at ?? 0),
+              liked,
+              interactionAt:
+                event.kind === "like" || event.kind === "unlike"
+                  ? event.at
+                  : old?.interactionAt,
+              likedAt:
+                event.kind === "unlike"
+                  ? undefined
+                  : event.kind === "like"
+                    ? event.at
+                    : old?.likedAt,
+              likedText,
+              tokens: tokens(latest.text),
+              likedTokens: liked ? tokens(likedText ?? post.text) : [],
+            };
+            row.preferenceAt = preferenceAt(row);
+            row.embedding =
+              isPreferencePost(row) &&
+              old &&
+              hasCurrentEmbedding(old) &&
+              preferenceText(row) === preferenceText(old)
+                ? old.embedding
+                : undefined;
+            row.embeddingVersion = row.embedding
+              ? EMBEDDING_VERSION
+              : undefined;
+            if (isOwnPost(row) && (!old || old.text !== row.text))
+              tx.objectStore("meta").put(crypto.randomUUID(), "revision");
+            const save = (keep: boolean) => {
+              if (keep) tx.objectStore("posts").put(row);
+              else tx.objectStore("posts").delete(key);
+              const accountKey = `${post.viewer}:${post.author}`;
+              const accountReq = tx.objectStore("accounts").get(accountKey);
+              accountReq.onsuccess = () => {
+                const account: AccountStats = accountReq.result ?? {
+                  key: accountKey,
+                  author: post.author,
+                  viewer: post.viewer,
+                  exposures: 0,
+                  feedExposures: 0,
+                  likes: 0,
+                };
+                if (event.kind === "exposure") {
+                  account.exposures++;
+                  if (event.context === "home-feed")
+                    account.feedExposures = (account.feedExposures ?? 0) + 1;
+                }
+                account.likes += Number(liked) - Number(old?.liked ?? false);
+                if (account.exposures || account.likes)
+                  tx.objectStore("accounts").put(account);
+                else tx.objectStore("accounts").delete(accountKey);
+                next();
+              };
+            };
+            if (event.kind === "unlike" && !isOwnPost(row)) {
+              const exposures = tx
+                .objectStore("events")
+                .index("postKindAt")
+                .count(
+                  IDBKeyRange.bound(
+                    [post.viewer, post.id, "exposure", 0],
+                    [post.viewer, post.id, "exposure", Number.MAX_VALUE],
+                  ),
+                );
+              exposures.onsuccess = () => save(exposures.result > 0);
+            } else save(true);
           };
-          if (event.kind === "exposure") {
-            account.exposures++;
-            if (event.context === "home-feed")
-              account.feedExposures = (account.feedExposures ?? 0) + 1;
-          }
-          account.likes += Number(liked) - Number(old?.liked ?? false);
-          tx.objectStore("accounts").put(account);
-          next();
+          if (event.kind === "unlike" || (event.kind === "like" && newer))
+            removePreferenceEvents(
+              tx,
+              post.viewer,
+              post.id,
+              event.at,
+              garbage,
+              apply,
+            );
+          else apply();
         };
       };
     };

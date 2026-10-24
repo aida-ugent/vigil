@@ -14,7 +14,6 @@ export interface AccountMetric {
   uniqueSeen: number;
   likedPosts: number;
   likeActions: number;
-  unlikeActions: number;
 }
 export interface DailyMetric {
   day: string;
@@ -26,7 +25,6 @@ export interface DashboardSummary {
   uniqueSeen: number;
   likedPosts: number;
   likeActions: number;
-  unlikeActions: number;
   accounts: AccountMetric[];
   days: DailyMetric[];
   domains: Array<{ domain: string; visits: number }>;
@@ -73,7 +71,12 @@ export function createSummary(filter: DashboardFilter) {
     domains = new Map<string, number>();
   let visits = 0;
   function add(event: ActivityEvent): void {
-    if (event.at < filter.from || event.at > filter.to) return;
+    if (
+      event.kind === "unlike" ||
+      event.at < filter.from ||
+      event.at > filter.to
+    )
+      return;
     if (event.kind === "visit") {
       try {
         const domain = new URL(event.url).hostname;
@@ -93,7 +96,6 @@ export function createSummary(filter: DashboardFilter) {
       uniqueSeen: 0,
       likedPosts: 0,
       likeActions: 0,
-      unlikeActions: 0,
     };
     const day = localDay(event.at);
     const daily = days.get(day) ?? { day, exposures: 0, likeActions: 0 };
@@ -112,7 +114,7 @@ export function createSummary(filter: DashboardFilter) {
         liked.add(key);
         account.likedPosts++;
       }
-    } else if (event.kind === "unlike") account.unlikeActions++;
+    }
     accounts.set(post.author, account);
     days.set(day, daily);
   }
@@ -123,7 +125,6 @@ export function createSummary(filter: DashboardFilter) {
       uniqueSeen: seen.size,
       likedPosts: liked.size,
       likeActions: rows.reduce((n, a) => n + a.likeActions, 0),
-      unlikeActions: rows.reduce((n, a) => n + a.unlikeActions, 0),
       accounts: rows.sort((a, b) => a.author.localeCompare(b.author)),
       days: [...days.values()].sort((a, b) => a.day.localeCompare(b.day)),
       domains: [...domains]
@@ -184,7 +185,8 @@ export function matchesRecord(
   event: ActivityEvent,
   filter: RecordFilter,
 ): boolean {
-  if (event.at < filter.from || event.at > filter.to) return false;
+  if (event.kind === "unlike" || event.at < filter.from || event.at > filter.to)
+    return false;
   if (filter.kind !== "all" && event.kind !== filter.kind) return false;
   if (filter.day && localDay(event.at) !== filter.day) return false;
   if (event.kind === "visit") {

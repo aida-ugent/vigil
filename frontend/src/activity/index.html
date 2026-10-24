@@ -115,7 +115,7 @@
             <span class="legend-dot amber">Unique posts</span>
           </div>
           <p class="hint">
-            Posts you liked during this period, even if later unliked.
+            Saved likes from this period. Unliking removes the saved like.
           </p>
           <div id="liked-chart" class="bars amber-bars"></div>
         </article>
@@ -128,7 +128,7 @@
           </div>
           <div class="legend">
             <span class="legend-dot">Times seen</span
-            ><span class="legend-dot amber">Like actions</span>
+            ><span class="legend-dot amber">Saved likes</span>
           </div>
         </div>
         <p class="hint">
@@ -139,7 +139,7 @@
           id="timeline"
           class="timeline"
           role="group"
-          aria-label="Daily exposures and like actions"
+          aria-label="Daily exposures and saved likes"
         ></div>
         <p id="timeline-note" class="hint"></p>
       </section>
@@ -171,8 +171,8 @@
             >Record type<select id="kind">
               <option value="all">All activity</option>
               <option value="exposure">Post exposures</option>
-              <option value="like">Like actions</option>
-              <option value="unlike">Unlike actions</option>
+              <option value="like">Saved likes</option>
+              <option value="unlike">Unsaved likes</option>
               <option value="visit">Website visits</option>
             </select></label
           ><label>Author<input id="author" placeholder="@account" /></label

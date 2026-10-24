@@ -17,29 +17,21 @@ export async function storageDiagnostics() {
     "texts",
   ]);
   const events = tx.objectStore("events");
-  const [
-    visits,
-    exposures,
-    likes,
-    unlikes,
-    posts,
-    accounts,
-    snapshots,
-    vectors,
-  ] = await Promise.all([
-    ...["visit", "exposure", "like", "unlike"].map((kind) =>
-      read(events.index("kind").count(kind)),
-    ),
-    read(tx.objectStore("posts").count()),
-    read(tx.objectStore("accounts").count()),
-    read(tx.objectStore("texts").count()),
-    read(
-      tx
-        .objectStore("posts")
-        .index("embeddingVersion")
-        .count(EMBEDDING_VERSION),
-    ),
-  ]);
+  const [visits, exposures, likes, posts, accounts, snapshots, vectors] =
+    await Promise.all([
+      ...["visit", "exposure", "like"].map((kind) =>
+        read(events.index("kind").count(kind)),
+      ),
+      read(tx.objectStore("posts").count()),
+      read(tx.objectStore("accounts").count()),
+      read(tx.objectStore("texts").count()),
+      read(
+        tx
+          .objectStore("posts")
+          .index("embeddingVersion")
+          .count(EMBEDDING_VERSION),
+      ),
+    ]);
   const [localBytes, analysisBytes, estimate] = await Promise.all([
     chrome.storage.local.getBytesInUse(null),
     chrome.storage.local.getBytesInUse("vigil_analysis_cache_v1"),
@@ -49,7 +41,6 @@ export async function storageDiagnostics() {
     visits,
     exposures,
     likes,
-    unlikes,
     posts,
     accounts,
     snapshots,
@@ -94,7 +85,7 @@ export function createStorageDiagnostics(): HTMLElement {
         "",
         `Website visits: ${data.visits.toLocaleString()}`,
         `X exposure events: ${data.exposures.toLocaleString()}`,
-        `Like / unlike events: ${data.likes.toLocaleString()} / ${data.unlikes.toLocaleString()}`,
+        `Saved likes: ${data.likes.toLocaleString()}`,
         `Stored X posts: ${data.posts.toLocaleString()}`,
         `Account records: ${data.accounts.toLocaleString()}`,
         `Shared text snapshots: ${data.snapshots.toLocaleString()}`,

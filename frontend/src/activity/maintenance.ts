@@ -1,4 +1,4 @@
-import { database } from "./database";
+import { database, saveEvents } from "./database";
 import { snapshotKey, storeSnapshot, type StoredEvent } from "./snapshots";
 
 const BATCH = 200;
@@ -103,10 +103,28 @@ export async function compactSnapshots(maxBatches = 100): Promise<void> {
   }
 }
 
+/** Apply legacy unlike commands using the same timestamp and reference safeguards as ingestion. */
+export async function removeUnlikeHistory(): Promise<void> {
+  const db = await database();
+  while (true) {
+    const events: StoredEvent[] = await read(
+      db
+        .transaction("events")
+        .objectStore("events")
+        .index("kind")
+        .getAll("unlike", BATCH),
+    );
+    if (!events.length) return;
+    await saveEvents(events);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+}
+
 let running: Promise<void> | undefined;
 export function maintainActivity(): Promise<void> {
   return (running ??= (async () => {
     await pruneVisits();
+    await removeUnlikeHistory();
     await compactSnapshots();
   })().finally(() => {
     running = undefined;

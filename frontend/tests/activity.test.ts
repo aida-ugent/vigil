@@ -1,3 +1,4 @@
+import type { StoredEvent } from "../src/activity/snapshots";
 import { DEFAULT_SETTINGS, SETTINGS_KEY } from "../src/shared/settings";
 import type { ContentAnalysisResult } from "../src/shared/content";
 import { eng } from "stopword";
@@ -28,6 +29,8 @@ import {
   EMBEDDING_DIMS,
   SIMILARITY_FLOOR,
   type ActivityEvent,
+  type StoredPost,
+  type AccountStats,
 } from "../src/activity/model";
 import { detectConfirmationBias } from "../src/plugins/confirmationBias";
 import { startActivityCollection } from "../src/activity/collector";
@@ -139,7 +142,7 @@ test("deduplicates retried events and updates same-account counts atomically", a
     event("like"),
   ]);
   const summary = await activitySummary();
-  assert.equal(summary.events, 4);
+  assert.equal(summary.events, 3);
   assert.equal(summary.posts, 2);
   assert.equal(summary.accounts[0].exposures, 2);
   assert.equal(summary.accounts[0].likes, 1);
@@ -1346,7 +1349,7 @@ test("retrieval excludes the library's English stopwords without altering post t
   ]);
 });
 
-test("dashboard distinguishes repeated exposures, unique likes and unlike actions", async () => {
+test("dashboard distinguishes repeated exposures and unique likes", async () => {
   const { createSummary } = await import("../src/activity/analytics");
   const accumulator = createSummary({
     from: 100,
@@ -1385,7 +1388,6 @@ test("dashboard distinguishes repeated exposures, unique likes and unlike action
   assert.equal(result.uniqueSeen, 2);
   assert.equal(result.likedPosts, 1);
   assert.equal(result.likeActions, 2);
-  assert.equal(result.unlikeActions, 1);
   assert.equal(result.visits, 1);
   assert.deepEqual(result.viewers, ["other", "reader"]);
   assert.equal(result.accounts.find((a) => a.author === "alice")!.exposures, 2);
@@ -2511,4 +2513,173 @@ test("storage diagnostics report counts, raw vector bytes and separate storage e
       Object.defineProperty(globalThis, "navigator", previousNavigator);
     else Reflect.deleteProperty(globalThis, "navigator");
   }
+});
+
+interface ActivityStoreRows {
+  events: StoredEvent;
+  posts: StoredPost;
+  accounts: AccountStats;
+  texts: { key: string; text: string };
+}
+async function activityStoreRows<K extends keyof ActivityStoreRows>(
+  name: K,
+): Promise<ActivityStoreRows[K][]> {
+  const { database } = await import("../src/activity/database");
+  const req = (await database()).transaction(name).objectStore(name).getAll();
+  return new Promise((resolve, reject) => {
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+test("unlike deletes the saved like, vector and unused text; retries cannot resurrect it", async () => {
+  await clearActivity();
+  const liked = event("like", "910", 1000);
+  liked.post!.text = "Solar energy evidence ".repeat(15);
+  await saveEvents([liked]);
+  await saveEmbeddings([
+    { key: "reader:910", text: liked.post!.text, embedding: vector(1) },
+  ]);
+  const unlike = {
+    ...liked,
+    id: crypto.randomUUID(),
+    kind: "unlike" as const,
+    at: 2000,
+  };
+  await saveEvents([unlike, unlike]);
+  for (const store of ["events", "posts", "texts", "accounts"] as const)
+    assert.deepEqual(await activityStoreRows(store), [], store);
+  // A late old unlike must not move the deletion timestamp backwards.
+  await saveEvents([
+    { ...unlike, id: crypto.randomUUID(), at: 1200 },
+    { ...liked, id: crypto.randomUUID(), at: 1500 },
+    liked,
+  ]);
+  assert.deepEqual(await activityStoreRows("events"), []);
+  assert.deepEqual(await activityStoreRows("posts"), []);
+  const relike = { ...liked, id: crypto.randomUUID(), at: 3000 };
+  await saveEvents([relike, unlike, liked, relike]);
+  assert.equal((await activityStoreRows("events")).length, 1);
+  assert.equal((await activityStoreRows("events"))[0].id, relike.id);
+  assert.equal((await activityStoreRows("posts"))[0].liked, true);
+  assert.equal((await activitySummary()).accounts[0].likes, 1);
+  const { dashboardSummary } = await import("../src/activity/analytics");
+  const stats = await dashboardSummary({
+    from: 0,
+    to: 4000,
+    viewer: "",
+    surface: "all",
+  });
+  assert.equal(stats.likeActions, 1);
+  assert.equal(stats.likedPosts, 1);
+});
+
+test("unlikes retain exposures and shared snapshots but remove like-only text; authored evidence survives", async () => {
+  await clearActivity();
+  const exposure = event("exposure", "920", 1000);
+  exposure.post!.text = "Visible solar evidence ".repeat(12);
+  const liked = {
+    ...exposure,
+    id: crypto.randomUUID(),
+    kind: "like" as const,
+    at: 1100,
+  };
+  const changedLike = {
+    ...liked,
+    id: crypto.randomUUID(),
+    at: 1200,
+    post: { ...liked.post!, text: "Changed solar evidence ".repeat(12) },
+  };
+  await saveEvents([exposure, liked, changedLike]);
+  await saveEmbeddings([
+    { key: "reader:920", text: changedLike.post.text, embedding: vector(1) },
+  ]);
+  await saveEvents([
+    { ...changedLike, id: crypto.randomUUID(), kind: "unlike", at: 1300 },
+  ]);
+  const records = await activityStoreRows("events");
+  assert.equal(records.length, 1);
+  assert.equal(records[0].id, exposure.id);
+  const texts = await activityStoreRows("texts");
+  assert.equal(texts.length, 1);
+  assert.equal(texts[0].text, exposure.post!.text);
+  const post = (await activityStoreRows("posts"))[0];
+  assert.equal(post.liked, false);
+  assert.equal(post.likedText, undefined);
+  assert.equal(post.likedAt, undefined);
+  assert.equal(post.embedding, undefined);
+  assert.equal(post.preferenceAt, undefined);
+  const exported = (await (await exportActivity()).text())
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  assert.deepEqual(
+    exported.find((row) => row.type === "events").data,
+    exposure,
+  );
+  const own = event("like", "921", 2000, "reader");
+  await saveEvents([own]);
+  await saveEmbeddings([
+    { key: "reader:921", text: own.post!.text, embedding: vector(1) },
+  ]);
+  await saveEvents([
+    { ...own, id: crypto.randomUUID(), kind: "unlike", at: 2100 },
+  ]);
+  const authored = (await activityStoreRows("posts")).find(
+    (row) => row.id === "921",
+  );
+  assert.equal(authored.liked, false);
+  assert.equal(authored.likedText, undefined);
+  assert.ok(
+    authored.embedding,
+    "own post remains independent authored evidence",
+  );
+  assert.ok(
+    (await activityStoreRows("events")).every(
+      (row) => row.kind !== "like" && row.kind !== "unlike",
+    ),
+  );
+});
+
+test("legacy unlike cleanup removes reversed likes while keeping subsequent re-likes", async () => {
+  const { database } = await import("../src/activity/database");
+  const { removeUnlikeHistory } = await import("../src/activity/maintenance");
+  await clearActivity();
+  const old = event("like", "930", 1000);
+  const unlike = {
+    ...old,
+    id: crypto.randomUUID(),
+    kind: "unlike" as const,
+    at: 2000,
+  };
+  const current = { ...old, id: crypto.randomUUID(), at: 3000 };
+  await saveEvents([old, unlike, current]);
+  const tx = (await database()).transaction("events", "readwrite");
+  const done = new Promise<void>((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onabort = () => reject(tx.error);
+  });
+  tx.objectStore("events").put(old);
+  tx.objectStore("events").put(unlike);
+  await done;
+  await removeUnlikeHistory();
+  await removeUnlikeHistory();
+  const records = await activityStoreRows("events");
+  assert.equal(records.length, 1);
+  assert.equal(records[0].id, current.id);
+  assert.equal((await activityStoreRows("posts"))[0].likedAt, 3000);
+  assert.equal((await activitySummary()).accounts[0].likes, 1);
+  const finalTx = (await database()).transaction("events", "readwrite");
+  const finalDone = new Promise<void>((resolve, reject) => {
+    finalTx.oncomplete = () => resolve();
+    finalTx.onabort = () => reject(finalTx.error);
+  });
+  finalTx
+    .objectStore("events")
+    .put({ ...unlike, id: crypto.randomUUID(), at: 4000 });
+  await finalDone;
+  await removeUnlikeHistory();
+  assert.deepEqual(await activityStoreRows("events"), []);
+  assert.deepEqual(await activityStoreRows("posts"), []);
+  assert.deepEqual(await activityStoreRows("accounts"), []);
 });
