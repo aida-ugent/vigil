@@ -22,11 +22,17 @@
         </p>
 
         <section class="settings-group-box" aria-label="Activity tracking">
-          <label class="field field--inline">
-            <input id="track-interactions" type="checkbox" role="switch" aria-describedby="tracking-description" />
-            <span>Track interactions</span>
-          </label>
-          <p class="meta" id="tracking-description">Store browsing activity, visible X posts (including your own), and likes to help detect confirmation bias and provide activity statistics.</p>
+          <div class="tracking-controls">
+            <label class="field field--inline">
+              <input id="track-interactions" type="checkbox" role="switch" aria-describedby="tracking-description" />
+              <span>Track interactions</span>
+            </label>
+            <button class="info-icon tracking-info" type="button" aria-label="About interaction tracking" aria-describedby="tracking-description">
+              i
+              <span class="tracking-tooltip" id="tracking-description" role="tooltip">Store browsing activity, visible X posts (including your own), and likes to help detect confirmation bias and provide activity statistics.</span>
+            </button>
+            <button id="activity-browse" class="btn btn-ghost btn-xs" type="button">Browse activity</button>
+          </div>
           <details class="disclosure">
             <summary class="disclosure-trigger">Activity and confirmation bias</summary>
             <div class="disclosure-body">
@@ -36,7 +42,6 @@
               <p class="meta" id="confirmation-status" role="status"></p>
               <button id="confirmation-diagnostics" class="btn btn-ghost btn-xs" type="button">CB diagnostics</button>
               <div class="btn-row">
-                <button id="activity-browse" class="btn btn-ghost btn-xs" type="button">Browse activity</button>
                 <button id="activity-refresh" class="btn btn-ghost btn-xs" type="button">Refresh statistics</button>
                 <button id="activity-export" class="btn btn-ghost btn-xs" type="button">Export activity</button>
                 <button id="activity-delete" class="btn btn-ghost btn-xs" type="button">Delete activity</button>

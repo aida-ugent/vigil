@@ -456,7 +456,8 @@ body {
   border-color: var(--accent);
 }
 
-.info-icon::after {
+.info-icon::after,
+.tracking-tooltip {
   content: attr(data-tooltip);
   position: absolute;
   left: 0;
@@ -479,8 +480,34 @@ body {
   z-index: 10;
 }
 
-.info-icon:hover::after {
+.info-icon:hover::after,
+.tracking-info:hover .tracking-tooltip,
+.tracking-info:focus .tracking-tooltip {
   opacity: 1;
+}
+
+.tracking-controls {
+  position: relative;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.tracking-info {
+  position: static;
+  padding: 0;
+  background: transparent;
+}
+
+.tracking-info::after {
+  content: none;
+}
+
+.tracking-tooltip {
+  width: min(280px, 100%);
+  max-width: none;
+  text-align: left;
 }
 
 .select,
