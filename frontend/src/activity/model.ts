@@ -4,7 +4,6 @@ import { z } from "zod";
 export const ACTIVITY_SETTINGS_KEY = "vigilActivitySettingsV1";
 export interface ActivitySettings {
   tracking: boolean;
-  confirmation: boolean;
 }
 export async function getActivitySettings(): Promise<ActivitySettings> {
   const raw = (await chrome.storage.local.get(ACTIVITY_SETTINGS_KEY))[
@@ -12,7 +11,6 @@ export async function getActivitySettings(): Promise<ActivitySettings> {
   ];
   return {
     tracking: raw?.tracking === true,
-    confirmation: raw?.confirmation !== false,
   };
 }
 export async function setActivitySettings(

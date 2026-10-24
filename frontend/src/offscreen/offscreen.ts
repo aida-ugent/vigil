@@ -1,7 +1,8 @@
 import * as webllm from "@mlc-ai/web-llm";
 import { drain, embed } from "../activity/embedding";
 import { EmbeddingBackfill } from "../activity/backfill";
-import { getActivitySettings } from "../activity/model";
+import { getSettings } from "../shared/settingsStorage";
+import { CONFIRMATION_PLUGIN_ID } from "../shared/confirmation";
 import { prepareEmbedding } from "../activity/embeddingRequest";
 import type { RuntimeEventMessage } from "../shared/messages";
 import {
@@ -105,7 +106,10 @@ function queueInference<T>(work: () => Promise<T>): Promise<T> {
 const backfill = new EmbeddingBackfill(
   () => queueInference(() => drain(8)),
   () => queuedInference > 0,
-  async () => (await getActivitySettings()).confirmation,
+  async () =>
+    (await getSettings()).selectedBrowserPlugins.includes(
+      CONFIRMATION_PLUGIN_ID,
+    ),
 );
 
 async function generate(

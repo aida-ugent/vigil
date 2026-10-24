@@ -1,3 +1,5 @@
+import { getSettings, subscribeSettings } from "../shared/settingsStorage";
+import { CONFIRMATION_PLUGIN_ID } from "../shared/confirmation";
 import { sendRuntimeMessage } from "../shared/messages";
 import {
   ACTIVITY_SETTINGS_KEY,
@@ -10,17 +12,16 @@ export function initializeActivityPanel(onInvalidated: () => void): void {
   const tracking = document.querySelector<HTMLInputElement>(
     "#track-interactions",
   )!;
-  const confirmation = document.querySelector<HTMLInputElement>(
-    "#confirmation-bias-enabled",
-  )!;
   const status = document.querySelector<HTMLElement>("#activity-status")!;
   const accounts = document.querySelector<HTMLElement>("#activity-accounts")!;
   async function render(): Promise<void> {
     const settings = await getActivitySettings();
     tracking.checked = settings.tracking;
-    confirmation.checked = settings.confirmation;
+    const confirmationEnabled = (
+      await getSettings()
+    ).selectedBrowserPlugins.includes(CONFIRMATION_PLUGIN_ID);
     const data = await activitySummary();
-    status.textContent = `${settings.tracking ? "Tracking on" : "Tracking paused"} · ${data.events} activity records · ${data.posts} posts. ${settings.confirmation ? "Confirmation-bias analysis needs at least 2 distinct relevant liked or self-authored posts. Unknown or mixed viewing identities are not analyzed." : "Confirmation-bias analysis off."}`;
+    status.textContent = `${settings.tracking ? "Tracking on" : "Tracking paused"} · ${data.events} activity records · ${data.posts} posts. ${confirmationEnabled ? "Confirmation-bias analysis needs at least 2 distinct relevant liked or self-authored posts. Unknown or mixed viewing identities are not analyzed." : "Confirmation-bias analysis off."}`;
     accounts.replaceChildren();
     for (const [label, metric] of [
       ["Most seen on your home feed", "feedExposures"],
@@ -46,10 +47,7 @@ export function initializeActivityPanel(onInvalidated: () => void): void {
     status.textContent =
       error instanceof Error ? error.message : "Activity operation failed.";
   }
-  for (const [input, key] of [
-    [tracking, "tracking"],
-    [confirmation, "confirmation"],
-  ] as const) {
+  for (const [input, key] of [[tracking, "tracking"]] as const) {
     input.addEventListener("change", () => {
       input.disabled = true;
       void setActivitySettings({ [key]: input.checked })
@@ -101,6 +99,9 @@ export function initializeActivityPanel(onInvalidated: () => void): void {
       onInvalidated();
       void render().catch(fail);
     }
+  });
+  subscribeSettings(() => {
+    void render().catch(fail);
   });
   void render().catch(fail);
 }

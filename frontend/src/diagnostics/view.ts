@@ -52,7 +52,7 @@ export function renderConfirmationTrace(
   if (!trace) {
     target.append(
       paragraph(
-        "No confirmation check recorded in this sidebar session. Click Analyze on a post to run a check after the existing detectors finish.",
+        "No confirmation check recorded in this sidebar session. Click Analyze on a post to run a check alongside the existing detectors.",
       ),
     );
     return;
@@ -66,6 +66,24 @@ export function renderConfirmationTrace(
       `${new Date(trace.startedAt).toLocaleString()} · ${trace.elapsedMs} ms · ${trace.backend}${trace.model ? ` · ${trace.model}` : ""}`,
     ),
   );
+  if (trace.timings) {
+    const labels: Record<string, string> = {
+      queueMs: "CB queue",
+      embeddingMs: "Embedding / indexing",
+      retrievalMs: "History retrieval",
+      inferenceMs: "CB LLM",
+      baseWaitMs: "Waiting for ordinary results",
+    };
+    target.append(
+      paragraph(
+        Object.entries(trace.timings)
+          .map(
+            ([key, ms]) => `${labels[key] ?? key}: ${ms.toLocaleString()} ms`,
+          )
+          .join(" · "),
+      ),
+    );
+  }
   target.append(section("Current content", trace.current.text, "current"));
   const contextHeading = document.createElement("h2");
   contextHeading.textContent = trace.request

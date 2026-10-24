@@ -1,6 +1,5 @@
 import { initializeConfirmationDiagnosticsView } from "../diagnostics/view";
 import { confirmationDiagnostics } from "../diagnostics/confirmation";
-import { getActivitySettings } from "../activity/model";
 import { ConfirmationAnalysisService } from "./confirmationAnalysisService";
 import { initializeActivityPanel } from "../activity/panel";
 import { PLUGIN_ID as CONFIRMATION_PLUGIN_ID } from "../plugins/confirmationBias";
@@ -92,6 +91,7 @@ let currentPageTitle = "";
 
 let currentViewingItem: ContentItem | null = null;
 const analyzingIds = new Set<string>();
+const confirmationRequestTokens = new Map<string, symbol>();
 const reformulatedIds = new Set<string>();
 
 type PanelTab = "analyze" | "settings";
@@ -103,7 +103,13 @@ const settingsCtrl = createSettingsController({
   onPanelStatus: setPanelStatus,
   onDiagnosticsChanged: updateDiagnostics,
   getCurrentSettings: () => currentSettings,
-  setCurrentSettings: (s) => { currentSettings = s; },
+  setCurrentSettings: (s) => {
+    const changed =
+      currentSettings.selectedBrowserPlugins.includes(CONFIRMATION_PLUGIN_ID) !==
+      s.selectedBrowserPlugins.includes(CONFIRMATION_PLUGIN_ID);
+    currentSettings = s;
+    if (changed) invalidateConfirmation();
+  },
 });
 
 // ── Helpers ──
@@ -360,25 +366,39 @@ async function runDefaultAction(contentId: string): Promise<void> {
 
 // ── Single-item analysis ──
 
-async function analyzeSingleItem(item: ContentItem, forceRefresh = false): Promise<void> {
+async function analyzeSingleItem(
+  item: ContentItem,
+  forceRefresh = false,
+): Promise<void> {
   if (analyzingIds.has(item.id)) return;
 
   const activePluginIds = getActivePluginIds(currentSettings);
-  if (activePluginIds.length === 0 && !(await getActivitySettings()).confirmation) {
-    setPanelStatus("No plugins selected. Enable at least one plugin in Settings.", "error");
+  if (activePluginIds.length === 0) {
+    setPanelStatus(
+      "No plugins selected. Enable at least one plugin in Settings.",
+      "error",
+    );
     return;
   }
 
   // When auto-analyze is on with an action intent (rewrite/delete),
   // obscure the content immediately so the user doesn't see triggering
   // text while the LLM is working.
-  const willAutoAct = currentSettings.autoAnalyze && currentSettings.defaultAction !== "none" && currentSettings.defaultAction !== "alternatives";
+  const willAutoAct =
+    currentSettings.autoAnalyze &&
+    currentSettings.defaultAction !== "none" &&
+    currentSettings.defaultAction !== "alternatives";
   if (willAutoAct) {
-    void sendRuntimeMessage({ type: "OBSCURE_CONTENT_REQUEST", payload: { contentId: item.id } });
+    void sendRuntimeMessage({
+      type: "OBSCURE_CONTENT_REQUEST",
+      payload: { contentId: item.id },
+    });
   }
 
   const generation = analysisGeneration;
   const originalTabId = activeTabId;
+  const requestToken = Symbol(item.id);
+  confirmationRequestTokens.set(item.id, requestToken);
   analyzingIds.add(item.id);
   if (analyzeCurrentBtn instanceof HTMLButtonElement) {
     analyzeCurrentBtn.innerHTML = SPINNER_HTML + " Analyzing\u2026";
@@ -387,50 +407,98 @@ async function analyzeSingleItem(item: ContentItem, forceRefresh = false): Promi
   setPanelStatus("Analyzing...", "neutral");
 
   try {
-    const { result: newResult, pipelineInfo } = await runAnalysis(item, currentSettings, { forceRefresh });
-    if (generation !== analysisGeneration) {
-      if (willAutoAct && originalTabId !== null) {
-        void chrome.tabs.sendMessage(originalTabId, {
-          type: "REVEAL_CONTENT",
-          payload: { contentId: item.id },
-        }).catch(() => {});
+    const baseReady = (async () => {
+      const { result: newResult, pipelineInfo } = await runAnalysis(
+        item,
+        currentSettings,
+        { forceRefresh },
+      );
+      if (generation !== analysisGeneration) {
+        if (willAutoAct && originalTabId !== null) {
+          void chrome.tabs
+            .sendMessage(originalTabId, {
+              type: "REVEAL_CONTENT",
+              payload: { contentId: item.id },
+            })
+            .catch(() => {});
+        }
+        return newResult;
       }
-      return;
-    }
-    upsertResult(newResult);
-    renderContentAnalysisResults(contentAnalysisResults);
-    await sendContentHighlights(contentAnalysisResults);
-    renderViewingCard();
+      upsertResult(newResult);
+      renderContentAnalysisResults(contentAnalysisResults);
+      await sendContentHighlights(contentAnalysisResults);
+      renderViewingCard();
+
+      if (newResult.cached) {
+        setPanelStatus(
+          `${newResult.findings.length} findings (cached).`,
+          newResult.findings.length > 0 ? "success" : "neutral",
+        );
+      } else {
+        const summary = `${newResult.findings.length} findings [${pipelineInfo.analyzersUsed}] · ${newResult.elapsedMs} ms`;
+        setPanelStatus(
+          pipelineInfo.warning
+            ? `${summary} — ${pipelineInfo.warning}`
+            : summary,
+          newResult.findings.length > 0 ? "success" : "neutral",
+        );
+      }
+
+      if (newResult.findings.length > 0) {
+        void sendRuntimeMessage({
+          type: "MARK_ANALYZED_REQUEST",
+          payload: { contentId: item.id, count: newResult.findings.length },
+        });
+        if (currentSettings.defaultAction !== "none")
+          void runDefaultAction(item.id);
+      } else {
+        // Clean content — reveal it (remove blur)
+        if (willAutoAct)
+          void sendRuntimeMessage({
+            type: "REVEAL_CONTENT_REQUEST",
+            payload: { contentId: item.id },
+          });
+        void sendRuntimeMessage({
+          type: "MARK_VERIFIED_REQUEST",
+          payload: { contentId: item.id },
+        });
+      }
+      return newResult;
+    })();
     void confirmationAnalysis.analyze({
       item,
-      base: newResult,
+      base: {
+        id: item.id,
+        text: item.text,
+        findings: [],
+        tips: [],
+        elapsedMs: 0,
+        cached: false,
+      },
+      baseReady,
+      requestToken,
       generation,
       tabId: originalTabId,
       llm: currentLLM,
-      model: currentSettings.llmBackend === "cloud-api" ? currentSettings.cloudModelId
-        : currentSettings.llmBackend === "local-api" ? currentSettings.localModelId
-        : currentSettings.llmBackend === "webllm" ? currentSettings.webllmModelId : undefined,
+      model:
+        currentSettings.llmBackend === "cloud-api"
+          ? currentSettings.cloudModelId
+          : currentSettings.llmBackend === "local-api"
+            ? currentSettings.localModelId
+            : currentSettings.llmBackend === "webllm"
+              ? currentSettings.webllmModelId
+              : undefined,
     });
-
-    if (newResult.cached) {
-      setPanelStatus(`${newResult.findings.length} findings (cached).`, newResult.findings.length > 0 ? "success" : "neutral");
-    } else {
-      const summary = `${newResult.findings.length} findings [${pipelineInfo.analyzersUsed}] · ${newResult.elapsedMs} ms`;
-      setPanelStatus(pipelineInfo.warning ? `${summary} — ${pipelineInfo.warning}` : summary, newResult.findings.length > 0 ? "success" : "neutral");
-    }
-
-    if (newResult.findings.length > 0) {
-      void sendRuntimeMessage({ type: "MARK_ANALYZED_REQUEST", payload: { contentId: item.id, count: newResult.findings.length } });
-      if (currentSettings.defaultAction !== "none") void runDefaultAction(item.id);
-    } else {
-      // Clean content — reveal it (remove blur)
-      if (willAutoAct) void sendRuntimeMessage({ type: "REVEAL_CONTENT_REQUEST", payload: { contentId: item.id } });
-      void sendRuntimeMessage({ type: "MARK_VERIFIED_REQUEST", payload: { contentId: item.id } });
-    }
+    await baseReady;
   } catch (error) {
+    confirmationRequestTokens.delete(item.id);
     console.error("[Vigil v2] Analysis failed", { id: item.id, error });
     // Analysis failed — reveal so user isn't stuck with blurred content
-    if (willAutoAct) void sendRuntimeMessage({ type: "REVEAL_CONTENT_REQUEST", payload: { contentId: item.id } });
+    if (willAutoAct)
+      void sendRuntimeMessage({
+        type: "REVEAL_CONTENT_REQUEST",
+        payload: { contentId: item.id },
+      });
     setPanelStatus("Analysis failed.", "error");
   } finally {
     analyzingIds.delete(item.id);
@@ -443,23 +511,37 @@ async function analyzeSingleItem(item: ContentItem, forceRefresh = false): Promi
 }
 
 const confirmationAnalysis = new ConfirmationAnalysisService({
-  isCurrent: ({ item, generation, tabId }) => {
-    const result = contentAnalysisResults.find(r => r.id === item.id);
-    return generation === analysisGeneration && tabId === activeTabId && result?.text === item.text;
+  isCurrent: ({ item, generation, tabId, requestToken }) => {
+    if (!currentSettings.selectedBrowserPlugins.includes(CONFIRMATION_PLUGIN_ID))
+      return false;
+    const result = contentAnalysisResults.find((r) => r.id === item.id);
+    return (
+      generation === analysisGeneration &&
+      tabId === activeTabId &&
+      confirmationRequestTokens.get(item.id) === requestToken &&
+      (analyzingIds.has(item.id) || result?.text === item.text)
+    );
   },
-  onStatus: message => {
+  onStatus: (message) => {
     const status = document.getElementById("confirmation-status");
     if (status) status.textContent = message;
   },
-  onResult: async ({ item, generation, tabId }, result) => {
-    const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    const current = contentAnalysisResults.find(entry => entry.id === item.id);
+  onResult: async ({ item, generation, tabId, requestToken }, result) => {
+    const [activeTab] = await chrome.tabs.query({
+      active: true,
+      currentWindow: true,
+    });
+    const current = contentAnalysisResults.find(
+      (entry) => entry.id === item.id,
+    );
     if (
       generation !== analysisGeneration ||
+      confirmationRequestTokens.get(item.id) !== requestToken ||
       activeTab?.id !== tabId ||
       activeTab.url !== item.pageUrl ||
       current?.text !== item.text
-    ) return;
+    )
+      return;
     upsertResult(result);
     renderContentAnalysisResults(contentAnalysisResults);
     renderViewingCard();
@@ -479,8 +561,10 @@ const confirmationAnalysis = new ConfirmationAnalysisService({
 });
 
 function invalidateConfirmation(): void {
+  confirmationAnalysis.cancelPending();
   confirmationDiagnostics.clear();
   analysisGeneration++;
+  confirmationRequestTokens.clear();
   const status = document.getElementById("confirmation-status");
   if (status) status.textContent = "";
   for (const result of contentAnalysisResults) {
@@ -765,6 +849,7 @@ function updateRewriteButtonState(): void {
 
 function clearTransientState(): void {
   analysisGeneration++;
+  confirmationRequestTokens.clear();
   const status = document.getElementById("confirmation-status");
   if (status) status.textContent = "";
   setContentReady(false);

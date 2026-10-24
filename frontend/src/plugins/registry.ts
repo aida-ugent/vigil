@@ -1,3 +1,4 @@
+import { ConfirmationBiasPlugin } from "./confirmationBias";
 import type { Finding } from "../shared/findings";
 import { PLUGIN_ID as COGNITIVE_BIAS_TRIGGER_LLM_PLUGIN_ID, CognitiveBiasTriggerLLMPlugin } from "./cognitiveBiasTrigger/llm";
 import { PLUGIN_ID as COGNITIVE_BIAS_TRIGGER_REGEX_PLUGIN_ID, CognitiveBiasTriggerRegexPlugin } from "./cognitiveBiasTrigger/regex";
@@ -54,6 +55,7 @@ export class BrowserPluginRegistry {
 export const browserPluginRegistry = new BrowserPluginRegistry([
   new CognitiveBiasTriggerRegexPlugin(),
   new CognitiveBiasTriggerLLMPlugin(),
+  new ConfirmationBiasPlugin(),
 ]);
 
 export const DEFAULT_BROWSER_PLUGIN_ID = COGNITIVE_BIAS_TRIGGER_REGEX_PLUGIN_ID;

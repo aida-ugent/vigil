@@ -3,7 +3,6 @@ import {
   type ConfirmationDiagnostics,
 } from "../diagnostics/confirmation";
 import {
-  getActivitySettings,
   tokens,
   preferenceText,
   isOwnPost,
@@ -11,7 +10,9 @@ import {
   validEmbedding,
 } from "../activity/model";
 import { related, revision } from "../activity/database";
-import { detectConfirmationBias } from "../plugins/confirmationBias";
+import { browserPluginRegistry } from "../plugins/registry";
+import { CONFIRMATION_PLUGIN_ID } from "../shared/confirmation";
+import { getSettings } from "../shared/settingsStorage";
 import type { ContentAnalysisResult, ContentItem } from "../shared/content";
 import type { LLMService } from "../llm/types";
 import { sendRuntimeMessage } from "../shared/messages";
@@ -46,6 +47,10 @@ async function queryVector(
 interface AnalysisRequest {
   item: ContentItem;
   base: ContentAnalysisResult;
+  /** Resolves after ordinary findings have been rendered; inference can overlap this work. */
+  baseReady?: Promise<ContentAnalysisResult>;
+  requestToken?: symbol;
+  queuedAt?: number;
   generation: number;
   tabId: number | null;
   llm: LLMService;
@@ -75,10 +80,15 @@ export class ConfirmationAnalysisService {
     private readonly diagnostics: ConfirmationDiagnostics = confirmationDiagnostics,
   ) {}
 
+  cancelPending(): void {
+    this.pending = null;
+  }
+
   async analyze(request: AnalysisRequest): Promise<void> {
     if (!this.callbacks.isCurrent(request)) return;
+    const queuedAt = request.queuedAt ?? performance.now();
     if (this.busy) {
-      this.pending = request;
+      this.pending = { ...request, queuedAt };
       return;
     }
 
@@ -92,6 +102,24 @@ export class ConfirmationAnalysisService {
       request.llm.backend,
       request.model,
     );
+    const timings: Record<string, number> = {
+      queueMs: Math.round(performance.now() - queuedAt),
+    };
+    const timed = async <T>(
+      name: string,
+      work: () => Promise<T>,
+    ): Promise<T> => {
+      const start = performance.now();
+      try {
+        return await work();
+      } finally {
+        timings[name] = Math.round(performance.now() - start);
+        this.diagnostics.update(trace, { timings: { ...timings } });
+      }
+    };
+    const baseReady = request.baseReady ?? Promise.resolve(request.base);
+    // Observe early rejection even if a cloud call is still running.
+    void baseReady.catch(() => {});
     const finish = (
       stage: "skipped" | "failed" | "discarded",
       reason: string,
@@ -101,17 +129,31 @@ export class ConfirmationAnalysisService {
     };
 
     try {
-      if (!(await getActivitySettings()).confirmation) {
+      if (
+        !(await getSettings()).selectedBrowserPlugins.includes(
+          CONFIRMATION_PLUGIN_ID,
+        ) ||
+        !this.callbacks.isCurrent(request)
+      ) {
         finish("skipped", "Confirmation-bias detection is disabled.");
         return;
       }
-      const { item, base, llm } = request;
+      const { item, llm } = request;
+      if (!llm.isAvailable()) {
+        finish("skipped", "The configured LLM is not available.");
+        status("Configure an LLM in Settings to detect confirmation bias.");
+        return;
+      }
       status("Preparing local semantic context…");
-      const embedding = await queryVector(item.text);
-      const evidence = await related(
-        item.text,
-        embedding.vector,
-        item.platform === "twitter" ? item.id : undefined,
+      const embedding = await timed("embeddingMs", () =>
+        queryVector(item.text),
+      );
+      const evidence = await timed("retrievalMs", () =>
+        related(
+          item.text,
+          embedding.vector,
+          item.platform === "twitter" ? item.id : undefined,
+        ),
       );
       // Only the discriminative terms are reported: showing filler as "matching" misleads.
       const queryTerms = evidence.queryTerms ?? tokens(item.text).slice(0, 24);
@@ -157,39 +199,73 @@ export class ConfirmationAnalysisService {
         );
         return;
       }
-      if (!llm.isAvailable()) {
-        finish("skipped", "The configured LLM is not available.");
-        status("Configure an LLM in Settings to detect confirmation bias.");
-        return;
+      // Do not contend for the same local model; cloud HTTP requests can overlap.
+      if (llm.backend !== "cloud-api") {
+        await timed("baseWaitMs", () => baseReady);
+        if (!this.callbacks.isCurrent(request)) {
+          finish(
+            "discarded",
+            "The page or analysis changed while waiting for the ordinary detector.",
+          );
+          return;
+        }
       }
 
+      // Re-read the switch after retrieval/model waits: disabling must prevent a new request.
+      const pluginSettings = await getSettings();
+      if (
+        !pluginSettings.selectedBrowserPlugins.includes(
+          CONFIRMATION_PLUGIN_ID,
+        ) ||
+        !this.callbacks.isCurrent(request)
+      ) {
+        finish(
+          "discarded",
+          "Confirmation-bias detection was disabled or analysis changed.",
+        );
+        return;
+      }
       status("Checking for possible confirmation bias…");
       const responses: Array<{ text: string; truncated: boolean }> = [];
       const validation: string[] = [];
-      const findings = await detectConfirmationBias(item.text, evidence, llm, {
-        onRequest: (payload) =>
-          this.diagnostics.update(trace, {
-            stage: "calling",
-            reason: "LLM request started.",
-            request: payload,
-          }),
-        onResponse: (raw) => {
-          responses.push({
-            text: raw.slice(0, 50000),
-            truncated: raw.length > 50000,
-          });
-          this.diagnostics.update(trace, { responses: responses.slice(-3) });
-        },
-        onValidation: (message) => {
-          validation.push(message);
-          this.diagnostics.update(trace, { validation: [...validation] });
-        },
-      });
-      const settings = await getActivitySettings();
+      const { findings } = await timed("inferenceMs", () =>
+        browserPluginRegistry.analyzeWith(CONFIRMATION_PLUGIN_ID, item.text, {
+          settings: pluginSettings,
+          evidence,
+          llm,
+          isCurrent: () => this.callbacks.isCurrent(request),
+          diagnostics: {
+            onRequest: (payload) =>
+              this.diagnostics.update(trace, {
+                stage: "calling",
+                reason: "LLM request started.",
+                request: payload,
+              }),
+            onResponse: (raw) => {
+              responses.push({
+                text: raw.slice(0, 50000),
+                truncated: raw.length > 50000,
+              });
+              this.diagnostics.update(trace, {
+                responses: responses.slice(-3),
+              });
+            },
+            onValidation: (message) => {
+              validation.push(message);
+              this.diagnostics.update(trace, { validation: [...validation] });
+            },
+          },
+        }),
+      );
+      const base =
+        llm.backend === "cloud-api"
+          ? await timed("baseWaitMs", () => baseReady)
+          : await baseReady;
+      const settings = await getSettings();
       const historyRevision = await revision();
       if (
         !this.callbacks.isCurrent(request) ||
-        !settings.confirmation ||
+        !settings.selectedBrowserPlugins.includes(CONFIRMATION_PLUGIN_ID) ||
         historyRevision !== evidence.revision
       ) {
         finish(

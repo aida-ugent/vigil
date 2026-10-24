@@ -1,3 +1,5 @@
+import { DEFAULT_SETTINGS, SETTINGS_KEY } from "../src/shared/settings";
+import type { ContentAnalysisResult } from "../src/shared/content";
 import { eng } from "stopword";
 import type { LLMService } from "../src/llm/types";
 import { ConfirmationAnalysisService } from "../src/sidepanel/confirmationAnalysisService";
@@ -391,7 +393,7 @@ test("collector is opt-in, requires dwell, captures media-only posts and stops w
 
 test("server discovery uses loaded and newly typed URLs instead of the initial default", async () => {
   const dom = new JSDOM(
-    '<input id="server-url"><span id="server-status-dot"></span><div id="server-plugins-list"></div><select id="llm-backend"><option value="none">Disabled</option></select>',
+    '<div id="browser-plugins-list"></div><input id="server-url"><span id="server-status-dot"></span><div id="server-plugins-list"></div><select id="llm-backend"><option value="none">Disabled</option></select>',
   );
   for (const name of [
     "window",
@@ -467,6 +469,20 @@ test("server discovery uses loaded and newly typed URLs instead of the initial d
   assert.equal(urls.at(-1), "http://127.0.0.1:28787/plugins");
   assert.equal(stored.serverUrl, "http://127.0.0.1:28787");
   assert.match(statuses.at(-1)!, /Connected/);
+  const cb = document.querySelector<HTMLInputElement>(
+    'input[data-plugin-id="confirmation-bias-llm"]',
+  )!;
+  assert.ok(cb, "CB is rendered in the Plugins list");
+  assert.equal(cb.checked, false, "CB defaults to opt-in");
+  cb.checked = true;
+  cb.dispatchEvent(new dom.window.Event("change"));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.ok(stored.selectedBrowserPlugins.includes("confirmation-bias-llm"));
+  cb.checked = false;
+  cb.dispatchEvent(new dom.window.Event("change"));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.ok(!stored.selectedBrowserPlugins.includes("confirmation-bias-llm"));
+
   dom.window.close();
 });
 
@@ -590,7 +606,7 @@ test("confirmation service discards results when history changes during inferenc
   Object.defineProperty(globalThis, "chrome", {
     configurable: true,
     value: {
-      storage: { local: { get: async () => ({}) } },
+      storage: enabledConfirmationStorage(),
     },
   });
   let finishInference: () => void;
@@ -651,7 +667,7 @@ test("confirmation service runs only the latest pending item and keeps existing 
   Object.defineProperty(globalThis, "chrome", {
     configurable: true,
     value: {
-      storage: { local: { get: async () => ({}) } },
+      storage: enabledConfirmationStorage(),
     },
   });
   let finishFirst: () => void;
@@ -998,7 +1014,7 @@ test("diagnostics capture the exact sent context and model output without provid
   await seed();
   Object.defineProperty(globalThis, "chrome", {
     configurable: true,
-    value: { storage: { local: { get: async () => ({}) } } },
+    value: { storage: enabledConfirmationStorage() },
   });
   const diagnostics = new ConfirmationDiagnostics();
   let sentSystem = "",
@@ -1060,7 +1076,7 @@ test("diagnostics distinguish skipped checks, invalid responses, and private pro
   await clearActivity();
   Object.defineProperty(globalThis, "chrome", {
     configurable: true,
-    value: { storage: { local: { get: async () => ({}) } } },
+    value: { storage: enabledConfirmationStorage() },
   });
   const diagnostics = new ConfirmationDiagnostics();
   let mode = "invalid";
@@ -1846,3 +1862,431 @@ test("large dashboard scans yield to queued activity writes without losing times
     IDBIndex.prototype.openCursor = original;
   }
 });
+
+test(
+  "cloud CB inference overlaps ordinary analysis but waits to merge its findings",
+  { timeout: 2000 },
+  async () => {
+    await seed();
+    Object.defineProperty(globalThis, "chrome", {
+      configurable: true,
+      value: {
+        storage: enabledConfirmationStorage(),
+      },
+    });
+    const { ConfirmationDiagnostics } = await import(
+      "../src/diagnostics/confirmation"
+    );
+    const diagnostics = new ConfirmationDiagnostics();
+    let start!: () => void;
+    const started = new Promise<void>((resolve) => {
+      start = resolve;
+    });
+    let publishBase!: (value: ContentAnalysisResult) => void;
+    const baseReady = new Promise<ContentAnalysisResult>((resolve) => {
+      publishBase = resolve;
+    });
+    const item = {
+      id: "parallel",
+      text: "solar energy research",
+      platform: "generic" as const,
+      pageUrl: "https://example.com",
+    };
+    const base: ContentAnalysisResult = {
+      id: item.id,
+      text: item.text,
+      findings: [],
+      tips: [],
+      elapsedMs: 0,
+      cached: false,
+    };
+    let applied: ContentAnalysisResult | undefined;
+    const llm: LLMService = {
+      backend: "cloud-api",
+      isAvailable: () => true,
+      complete: async () => "",
+      completeJSON: async (_system, _user, parse) => {
+        start();
+        return parse('{"findings":[]}');
+      },
+    };
+    const service = new ConfirmationAnalysisService(
+      {
+        isCurrent: () => true,
+        onStatus() {},
+        onResult: async (_request, result) => {
+          applied = result;
+        },
+      },
+      diagnostics,
+    );
+    const running = service.analyze({
+      item,
+      base,
+      baseReady,
+      llm,
+      generation: 1,
+      tabId: 1,
+    });
+    await started;
+    assert.equal(
+      applied,
+      undefined,
+      "must not replace ordinary findings before they arrive",
+    );
+    const finding = {
+      term: "solar",
+      label: "Existing",
+      explanation: "Existing result",
+      severity: "low" as const,
+      pluginId: "existing",
+    };
+    publishBase({ ...base, findings: [finding] });
+    await running;
+    assert.deepEqual(applied!.findings, [finding]);
+    for (const stage of [
+      "queueMs",
+      "embeddingMs",
+      "retrievalMs",
+      "inferenceMs",
+      "baseWaitMs",
+    ]) {
+      assert.ok(diagnostics.get()!.timings![stage] >= 0);
+    }
+  },
+);
+
+for (const backend of ["local-api", "webllm"] as const) {
+  test(
+    `${backend} CB prepares context early but waits before shared-model generation`,
+    { timeout: 2000 },
+    async () => {
+      await seed();
+      Object.defineProperty(globalThis, "chrome", {
+        configurable: true,
+        value: {
+          storage: enabledConfirmationStorage(),
+        },
+      });
+      const { ConfirmationDiagnostics } = await import(
+        "../src/diagnostics/confirmation"
+      );
+      const diagnostics = new ConfirmationDiagnostics();
+      let retrieved!: () => void;
+      const ready = new Promise<void>((resolve) => {
+        retrieved = resolve;
+      });
+      diagnostics.subscribe(() => {
+        if (diagnostics.get()?.timings?.retrievalMs !== undefined) retrieved();
+      });
+      let publishBase!: (value: ContentAnalysisResult) => void;
+      const baseReady = new Promise<ContentAnalysisResult>((resolve) => {
+        publishBase = resolve;
+      });
+      const item = {
+        id: "serial",
+        text: "solar energy research",
+        platform: "generic" as const,
+        pageUrl: "https://example.com",
+      };
+      const base: ContentAnalysisResult = {
+        id: item.id,
+        text: item.text,
+        findings: [],
+        tips: [],
+        elapsedMs: 0,
+        cached: false,
+      };
+      let calls = 0;
+      const llm: LLMService = {
+        backend,
+        isAvailable: () => true,
+        complete: async () => "",
+        completeJSON: async (_system, _user, parse) => {
+          calls++;
+          return parse('{"findings":[]}');
+        },
+      };
+      const service = new ConfirmationAnalysisService(
+        { isCurrent: () => true, onStatus() {}, onResult: async () => {} },
+        diagnostics,
+      );
+      const running = service.analyze({
+        item,
+        base,
+        baseReady,
+        llm,
+        generation: 1,
+        tabId: 1,
+      });
+      await ready;
+      assert.equal(calls, 0);
+      publishBase(base);
+      await running;
+      assert.equal(calls, 1);
+    },
+  );
+}
+
+test(
+  "cloud results are discarded if the request becomes obsolete while awaiting ordinary results",
+  { timeout: 2000 },
+  async () => {
+    await seed();
+    Object.defineProperty(globalThis, "chrome", {
+      configurable: true,
+      value: {
+        storage: enabledConfirmationStorage(),
+      },
+    });
+    let start!: () => void;
+    const started = new Promise<void>((resolve) => {
+      start = resolve;
+    });
+    let publishBase!: (value: ContentAnalysisResult) => void;
+    const baseReady = new Promise<ContentAnalysisResult>((resolve) => {
+      publishBase = resolve;
+    });
+    const item = {
+      id: "obsolete",
+      text: "solar energy research",
+      platform: "generic" as const,
+      pageUrl: "https://example.com",
+    };
+    const base: ContentAnalysisResult = {
+      id: item.id,
+      text: item.text,
+      findings: [],
+      tips: [],
+      elapsedMs: 0,
+      cached: false,
+    };
+    let current = true,
+      applied = false;
+    const llm: LLMService = {
+      backend: "cloud-api",
+      isAvailable: () => true,
+      complete: async () => "",
+      completeJSON: async (_system, _user, parse) => {
+        start();
+        return parse('{"findings":[]}');
+      },
+    };
+    const service = new ConfirmationAnalysisService({
+      isCurrent: () => current,
+      onStatus() {},
+      onResult: async () => {
+        applied = true;
+      },
+    });
+    const running = service.analyze({
+      item,
+      base,
+      baseReady,
+      llm,
+      generation: 1,
+      tabId: 1,
+    });
+    await started;
+    current = false;
+    publishBase(base);
+    await running;
+    assert.equal(applied, false);
+  },
+);
+
+for (const disableAt of [
+  "before",
+  "retrieval",
+  "waiting",
+  "inference",
+] as const) {
+  test(
+    `CB plugin stops new requests when disabled ${disableAt} and can be re-enabled`,
+    { timeout: 2000 },
+    async () => {
+      await seed();
+      let enabled = disableAt !== "before";
+      let embeddingCalls = 0;
+      let llmCalls = 0;
+      let applied = 0;
+      const settings = () => ({
+        ...DEFAULT_SETTINGS,
+        selectedBrowserPlugins: enabled ? ["confirmation-bias-llm"] : [],
+      });
+      Object.defineProperty(globalThis, "chrome", {
+        configurable: true,
+        value: {
+          storage: {
+            sync: { get: async () => ({ [SETTINGS_KEY]: settings() }) },
+          },
+          runtime: {
+            sendMessage: async () => {
+              embeddingCalls++;
+              if (disableAt === "retrieval") enabled = false;
+              return { payload: { ok: false, pending: 0, error: "Offline" } };
+            },
+          },
+        },
+      });
+      const item = {
+        id: "plugin-toggle",
+        text: "solar energy research",
+        platform: "generic" as const,
+        pageUrl: "https://example.com",
+      };
+      const base: ContentAnalysisResult = {
+        id: item.id,
+        text: item.text,
+        findings: [],
+        tips: [],
+        elapsedMs: 0,
+        cached: false,
+      };
+      let release!: (value: ContentAnalysisResult) => void;
+      const baseReady = new Promise<ContentAnalysisResult>((resolve) => {
+        release = resolve;
+      });
+      const { ConfirmationDiagnostics } = await import(
+        "../src/diagnostics/confirmation"
+      );
+      const diagnostics = new ConfirmationDiagnostics();
+      let disableScheduled = false;
+      diagnostics.subscribe(() => {
+        if (
+          disableAt === "waiting" &&
+          !disableScheduled &&
+          diagnostics.get()?.timings?.retrievalMs !== undefined
+        ) {
+          disableScheduled = true;
+          // Let retrieval finish and the service enter its ordinary-analysis wait.
+          setTimeout(() => {
+            void service.analyze({
+              item: { ...item, id: "queued" },
+              base,
+              llm,
+              generation: 1,
+              tabId: 1,
+            });
+            enabled = false;
+            service.cancelPending();
+            release(base);
+          }, 0);
+        }
+      });
+      const llm: LLMService = {
+        backend: "local-api",
+        isAvailable: () => true,
+        complete: async () => "",
+        completeJSON: async (_system, _user, parse) => {
+          llmCalls++;
+          if (disableAt === "inference") enabled = false;
+          return parse('{"findings":[]}');
+        },
+      };
+      const service = new ConfirmationAnalysisService(
+        {
+          // Deliberately independent of settings to test the service's own persisted gates.
+          isCurrent: () => true,
+          onStatus() {},
+          onResult: async () => {
+            applied++;
+          },
+        },
+        diagnostics,
+      );
+      if (disableAt !== "waiting") release(base);
+      await service.analyze({
+        item,
+        base,
+        baseReady,
+        llm,
+        generation: 1,
+        tabId: 1,
+      });
+      assert.equal(llmCalls, disableAt === "inference" ? 1 : 0);
+      assert.equal(applied, 0, "disabled checks must never publish findings");
+      if (disableAt === "before") assert.equal(embeddingCalls, 0);
+      if (disableAt === "waiting") {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.equal(
+          embeddingCalls,
+          1,
+          "cancelled queued checks must not prepare context",
+        );
+        assert.ok(diagnostics.get()!.timings!.baseWaitMs >= 0);
+      }
+      // Existing activity is retained and usable after switching the plugin back on.
+      if (disableAt === "before") {
+        enabled = true;
+        await service.analyze({ item, base, llm, generation: 2, tabId: 1 });
+        assert.equal(llmCalls, 1);
+        assert.equal(applied, 1);
+      }
+    },
+  );
+}
+
+test("CB is a registered history plugin and the ordinary pipeline never calls it", async () => {
+  const { browserPluginRegistry } = await import("../src/plugins/registry");
+  const { analyzeTextWithPlugins } = await import(
+    "../src/sidepanel/analysisService"
+  );
+  const plugin = browserPluginRegistry.get("confirmation-bias-llm")!;
+  assert.equal(plugin.metadata.requiresHistory, true);
+  assert.equal(plugin.metadata.requiresLLM, true);
+  let calls = 0;
+  const llm: LLMService = {
+    backend: "cloud-api",
+    isAvailable: () => true,
+    complete: async () => "",
+    completeJSON: async (_system, _user, parse) => {
+      calls++;
+      return parse('{"findings":[]}');
+    },
+  };
+  const settings = {
+    ...DEFAULT_SETTINGS,
+    selectedBrowserPlugins: [plugin.metadata.id],
+  };
+  const result = await analyzeTextWithPlugins(
+    "solar energy research",
+    settings,
+    llm,
+    {} as never,
+  );
+  assert.deepEqual(result.findings, []);
+  assert.equal(
+    calls,
+    0,
+    "history plugin must only run through the uncached history scheduler",
+  );
+  await seed();
+  const evidence = await related("solar energy research");
+  await browserPluginRegistry.analyzeWith(
+    plugin.metadata.id,
+    "solar energy research",
+    { settings: { ...settings, selectedBrowserPlugins: [] }, evidence, llm },
+  );
+  assert.equal(calls, 0, "plugin also guards disabled direct invocations");
+  await browserPluginRegistry.analyzeWith(
+    plugin.metadata.id,
+    "solar energy research",
+    { settings, evidence, llm },
+  );
+  assert.equal(calls, 1);
+});
+
+function enabledConfirmationStorage() {
+  return {
+    local: { get: async () => ({}) },
+    sync: {
+      get: async () => ({
+        [SETTINGS_KEY]: {
+          ...DEFAULT_SETTINGS,
+          selectedBrowserPlugins: ["confirmation-bias-llm"],
+        },
+      }),
+    },
+  };
+}

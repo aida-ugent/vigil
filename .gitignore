@@ -29,6 +29,10 @@ tmp/
 # Ruff
 .ruff_cache/
 
+# Vendored embedding runtime and weights (see "npm run assets")
+frontend/public/ort/
+frontend/public/models/
+
 # Personal activity / diagnostic exports
 vigil-cb-diagnostics-*.json
 vigil-activity-*.jsonl

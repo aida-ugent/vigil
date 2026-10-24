@@ -1,6 +1,12 @@
+import type {
+  BrowserPlugin,
+  PluginContext,
+  PluginAnalyzeResult,
+  PluginDiagnosticHooks,
+} from "../types";
 import { z } from "zod";
 import type { Finding } from "../../shared/findings";
-import type { LLMOptions, LLMService } from "../../llm/types";
+import type { LLMService } from "../../llm/types";
 import type { Evidence } from "../../activity/model";
 
 import { CONFIRMATION_PLUGIN_ID } from "../../shared/confirmation";
@@ -55,15 +61,7 @@ export function parseResponse(raw: string) {
     ),
   );
 }
-export interface ConfirmationDiagnosticHooks {
-  onRequest?(request: {
-    system: string;
-    user: string;
-    options: LLMOptions;
-  }): void;
-  onResponse?(raw: string): void;
-  onValidation?(message: string): void;
-}
+export type ConfirmationDiagnosticHooks = PluginDiagnosticHooks;
 /** History-aware analyzer composed by ConfirmationAnalysisService after the
  * ordinary plugin pipeline. Its evidence requirement is not part of BrowserPlugin.
  */
@@ -156,4 +154,40 @@ export async function detectConfirmationBias(
     });
   }
   return findings;
+}
+
+/** History-aware plugin; its scheduler supplies fresh evidence outside the text-only cache. */
+export class ConfirmationBiasPlugin implements BrowserPlugin {
+  readonly metadata = {
+    id: PLUGIN_ID,
+    name: "Confirmation bias",
+    version: "1.0.0",
+    description:
+      "Use relevant saved likes and your own posts to flag aligned claims with limited evidence. Relevant excerpts are sent to your selected LLM.",
+    supportedLabels: ["Possible confirmation bias"],
+    requiresLLM: true,
+    requiresHistory: true,
+    canReformulate: false,
+  };
+
+  async analyze(
+    text: string,
+    context: PluginContext,
+  ): Promise<PluginAnalyzeResult> {
+    if (
+      !context.settings.selectedBrowserPlugins.includes(PLUGIN_ID) ||
+      !context.evidence ||
+      !context.llm ||
+      context.isCurrent?.() === false
+    ) {
+      return { findings: [], tips: [] };
+    }
+    const findings = await detectConfirmationBias(
+      text,
+      context.evidence,
+      context.llm,
+      context.diagnostics,
+    );
+    return { findings, tips: [] };
+  }
 }

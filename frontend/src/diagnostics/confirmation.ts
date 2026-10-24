@@ -17,6 +17,8 @@ export interface ConfirmationTrace {
   id: number;
   startedAt: number;
   elapsedMs: number;
+  /** Wall-clock stage durations; inference includes provider time and local queue waits. */
+  timings?: Record<string, number>;
   stage:
     | "retrieving"
     | "skipped"

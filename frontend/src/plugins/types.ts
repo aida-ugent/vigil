@@ -1,6 +1,7 @@
+import type { Evidence } from "../activity/model";
 import type { Finding } from "../shared/findings";
 import type { VigilSettings } from "../shared/settings";
-import type { LLMService } from "../llm/types";
+import type { LLMOptions, LLMService } from "../llm/types";
 
 export interface PluginMetadata {
   id: string;
@@ -9,13 +10,24 @@ export interface PluginMetadata {
   description: string;
   supportedLabels: string[];
   requiresLLM: boolean;
+  /** History-dependent plugins run outside the ordinary analysis cache. */
+  requiresHistory?: boolean;
   canReformulate: boolean;
+}
+
+export interface PluginDiagnosticHooks {
+  onRequest?(request: { system: string; user: string; options: LLMOptions }): void;
+  onResponse?(raw: string): void;
+  onValidation?(message: string): void;
 }
 
 export interface PluginContext {
   settings: VigilSettings;
   llm?: LLMService;
   maxFindings?: number;
+  evidence?: Evidence;
+  diagnostics?: PluginDiagnosticHooks;
+  isCurrent?: () => boolean;
 }
 
 export interface PluginAnalyzeResult {
