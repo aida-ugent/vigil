@@ -2290,3 +2290,225 @@ function enabledConfirmationStorage() {
     },
   };
 }
+
+test("visit retention removes only visits older than a calendar month, across batches", async () => {
+  const { pruneVisits, visitCutoff } = await import(
+    "../src/activity/maintenance"
+  );
+  await clearActivity();
+  const now = Date.UTC(2026, 2, 31, 12);
+  const cutoff = Date.UTC(2026, 1, 28, 12);
+  assert.equal(visitCutoff(now), cutoff);
+  assert.equal(visitCutoff(Date.UTC(2024, 2, 31)), Date.UTC(2024, 1, 29));
+  assert.equal(visitCutoff(Date.UTC(2026, 0, 15)), Date.UTC(2025, 11, 15));
+  const visit = (at: number): ActivityEvent => ({
+    id: crypto.randomUUID(),
+    kind: "visit",
+    at,
+    url: "https://example.com/",
+    session: "retention",
+  });
+  const expired = Array.from({ length: 450 }, () => visit(cutoff - 1));
+  const boundary = visit(cutoff),
+    recent = visit(now);
+  const liked = event("like", "500", cutoff - 1000);
+  const exposure = event("exposure", "501", cutoff - 1000);
+  await saveEvents([...expired, boundary, recent, liked, exposure]);
+  const before = await activitySummary();
+  const historyRevision = await revision();
+  assert.equal(await pruneVisits(now), 450);
+  assert.equal(await pruneVisits(now), 0);
+  const after = await activitySummary();
+  assert.equal(after.events, 4);
+  assert.equal(after.posts, before.posts);
+  assert.deepEqual(after.accounts, before.accounts);
+  assert.equal(await revision(), historyRevision);
+  const visits = await browseActivity({ kind: "visits" });
+  assert.deepEqual(
+    new Set(visits.rows.map((row) => row.data.id)),
+    new Set([boundary.id, recent.id]),
+  );
+});
+
+test("shared snapshots preserve historical text, dashboard searches and exports", async () => {
+  const { database } = await import("../src/activity/database");
+  const { dashboardRecords, dashboardSummary } = await import(
+    "../src/activity/analytics"
+  );
+  await clearActivity();
+  const first = event("exposure", "700", 1000);
+  first.post!.text = "Original solar evidence ".repeat(12);
+  const liked = {
+    ...first,
+    id: crypto.randomUUID(),
+    kind: "like" as const,
+    at: 1001,
+  };
+  const repeat = { ...first, id: crypto.randomUUID(), at: 1002 };
+  const edited = {
+    ...first,
+    id: crypto.randomUUID(),
+    at: 1003,
+    post: { ...first.post!, text: "Edited solar evidence ".repeat(12) },
+  };
+  await saveEvents([first, liked, repeat, edited, first]);
+  const db = await database();
+  const read = <T>(req: IDBRequest<T>) =>
+    new Promise<T>((resolve, reject) => {
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  assert.equal(
+    await read(db.transaction("texts").objectStore("texts").count()),
+    2,
+  );
+  const stored = await read(
+    db.transaction("events").objectStore("events").getAll(),
+  );
+  assert.equal(stored.length, 4);
+  assert.ok(stored.every((row) => row.post.text === "" && row.textKey));
+  const filter = {
+    from: 0,
+    to: 2000,
+    viewer: "",
+    surface: "all" as const,
+    kind: "all" as const,
+    author: "",
+    query: "Original",
+    day: "",
+    domain: "",
+  };
+  const records = await dashboardRecords(filter);
+  assert.equal(records.rows.length, 3);
+  assert.ok(records.rows.every((row) => row.post!.text === first.post!.text));
+  const summary = await dashboardSummary(filter);
+  assert.equal(summary.exposures, 3);
+  assert.equal(summary.likeActions, 1);
+  const exported = (await (await exportActivity()).text())
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  const events = exported
+    .filter((row) => row.type === "events")
+    .map((row) => row.data);
+  for (const original of [first, liked, repeat, edited])
+    assert.deepEqual(
+      events.find((row) => row.id === original.id),
+      original,
+    );
+  const post = exported.find((row) => row.type === "posts").data;
+  assert.equal(post.likedText, first.post!.text);
+  assert.equal(post.text, edited.post.text);
+  const short = event("exposure", "701");
+  short.post!.text = "Brief post";
+  await saveEvents([short]);
+  assert.deepEqual(
+    await read(db.transaction("events").objectStore("events").get(short.id)),
+    short,
+  );
+  assert.equal(
+    await read(db.transaction("texts").objectStore("texts").count()),
+    2,
+    "short text stays inline without extra records",
+  );
+  await clearActivity();
+  assert.equal(
+    await read(db.transaction("texts").objectStore("texts").count()),
+    0,
+  );
+});
+
+test("legacy snapshot compaction resumes without changing events, counts or evidence", async () => {
+  const { database } = await import("../src/activity/database");
+  const { compactSnapshots } = await import("../src/activity/maintenance");
+  await clearActivity();
+  const events = Array.from({ length: 205 }, (_, i) =>
+    event(i === 0 ? "like" : "exposure", "900", 1000 + i),
+  );
+  for (const item of events) item.post!.text = item.post!.text.repeat(5);
+  await saveEvents(events);
+  const before = await activitySummary();
+  const historyRevision = await revision();
+  const db = await database();
+  const tx = db.transaction(["events", "texts"], "readwrite");
+  const done = new Promise<void>((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onabort = () => reject(tx.error);
+  });
+  tx.objectStore("texts").clear();
+  // Simulate the inline event representation written before schema version 6.
+  for (const event of events) tx.objectStore("events").put(event);
+  await done;
+  await compactSnapshots(1);
+  await compactSnapshots(1);
+  await compactSnapshots(1);
+  assert.deepEqual(await activitySummary(), before);
+  assert.equal(await revision(), historyRevision);
+  const exported = (await (await exportActivity()).text())
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  const restored = exported
+    .filter((row) => row.type === "events")
+    .map((row) => row.data);
+  assert.equal(restored.length, events.length);
+  for (const original of events)
+    assert.deepEqual(
+      restored.find((row) => row.id === original.id),
+      original,
+    );
+  const req = db.transaction("texts").objectStore("texts").count();
+  assert.equal(
+    await new Promise<number>((resolve) => {
+      req.onsuccess = () => resolve(req.result);
+    }),
+    1,
+  );
+});
+
+test("storage diagnostics report counts, raw vector bytes and separate storage estimates", async () => {
+  const { storageDiagnostics } = await import("../src/diagnostics/storage");
+  await clearActivity();
+  const liked = event("like");
+  liked.post!.text = liked.post!.text.repeat(5);
+  await saveEvents([liked]);
+  await saveEmbeddings([
+    { key: "reader:123", text: liked.post!.text, embedding: vector(1) },
+  ]);
+  const previousNavigator = Object.getOwnPropertyDescriptor(
+    globalThis,
+    "navigator",
+  );
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: {
+      storage: { estimate: async () => ({ usage: 10000, quota: 20000 }) },
+    },
+  });
+  Object.defineProperty(globalThis, "chrome", {
+    configurable: true,
+    value: {
+      storage: {
+        local: {
+          getBytesInUse: async (key: string | null) => (key ? 100 : 200),
+        },
+      },
+    },
+  });
+  try {
+    const result = await storageDiagnostics();
+    assert.equal(result.likes, 1);
+    assert.equal(result.posts, 1);
+    assert.equal(result.snapshots, 1);
+    assert.equal(result.vectors, 1);
+    assert.equal(result.vectorBytes, 1536);
+    assert.equal(result.localBytes, 200);
+    assert.equal(result.analysisBytes, 100);
+    assert.equal(result.webBytes, 10000);
+    assert.equal(result.quotaBytes, 20000);
+  } finally {
+    if (previousNavigator)
+      Object.defineProperty(globalThis, "navigator", previousNavigator);
+    else Reflect.deleteProperty(globalThis, "navigator");
+  }
+});

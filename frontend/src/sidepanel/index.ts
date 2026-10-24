@@ -1,3 +1,4 @@
+import { createStorageDiagnostics } from "../diagnostics/storage";
 import { initializeConfirmationDiagnosticsView } from "../diagnostics/view";
 import { confirmationDiagnostics } from "../diagnostics/confirmation";
 import { ConfirmationAnalysisService } from "./confirmationAnalysisService";
@@ -988,6 +989,7 @@ async function init(): Promise<void> {
   bindAnalyzeActions();
   initializeActivityPanel(invalidateConfirmation);
   initializeConfirmationDiagnosticsView();
+  document.getElementById("storage-diagnostics")?.append(createStorageDiagnostics());
   settingsCtrl.bind();
   await initializeRuntimeConnection();
 

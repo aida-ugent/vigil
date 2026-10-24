@@ -1,3 +1,4 @@
+import { maintainActivity } from "./maintenance";
 import {
   isRuntimeRequestMessage,
   type RuntimeResponseMap,
@@ -125,3 +126,33 @@ chrome.storage.onChanged.addListener((changes, area) => {
       console.warn("[Vigil activity] Failed to record navigation", error),
     );
 });
+
+// Alarms survive worker suspension; recreate if Chrome has cleared them on restart.
+const MAINTENANCE_ALARM = "vigil-activity-maintenance";
+function maintenance(): void {
+  void maintainActivity().catch((error) =>
+    console.warn("[Vigil activity] Maintenance failed", error),
+  );
+}
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === MAINTENANCE_ALARM) maintenance();
+});
+async function initializeMaintenance(): Promise<void> {
+  await chrome.alarms.create(MAINTENANCE_ALARM, { periodInMinutes: 60 });
+  maintenance();
+}
+function scheduleMaintenance(): void {
+  void initializeMaintenance().catch((error) =>
+    console.warn("[Vigil activity] Maintenance could not be scheduled", error),
+  );
+}
+chrome.runtime.onInstalled.addListener(scheduleMaintenance);
+chrome.runtime.onStartup.addListener(scheduleMaintenance);
+void chrome.alarms
+  .get(MAINTENANCE_ALARM)
+  .then((alarm) => {
+    if (!alarm) return initializeMaintenance();
+  })
+  .catch((error) =>
+    console.warn("[Vigil activity] Maintenance could not be scheduled", error),
+  );

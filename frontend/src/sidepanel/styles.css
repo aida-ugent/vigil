@@ -1336,3 +1336,10 @@ body {
 }
 
 
+
+#storage-diagnostics pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: 11px/1.5 var(--font-mono);
+  color: var(--text-2);
+}

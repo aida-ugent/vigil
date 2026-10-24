@@ -1,3 +1,4 @@
+import { snapshotKey, storeSnapshot, restoreSnapshot } from "./snapshots";
 import {
   tokens,
   evidenceReady,
@@ -24,7 +25,7 @@ import {
 let opening: Promise<IDBDatabase> | undefined;
 export function database(): Promise<IDBDatabase> {
   return (opening ??= new Promise((resolve, reject) => {
-    const req = indexedDB.open("vigil-activity", 5);
+    const req = indexedDB.open("vigil-activity", 6);
     req.onupgradeneeded = (event) => {
       const db = req.result;
       if (event.oldVersion < 1) {
@@ -37,6 +38,15 @@ export function database(): Promise<IDBDatabase> {
         posts.createIndex("likedTokens", "likedTokens", { multiEntry: true });
         db.createObjectStore("accounts", { keyPath: "key" });
         db.createObjectStore("meta");
+      }
+      if (event.oldVersion < 6) {
+        db.createObjectStore("texts", { keyPath: "key" });
+        req
+          .transaction!.objectStore("events")
+          .createIndex("kindAt", ["kind", "at"]);
+        req
+          .transaction!.objectStore("posts")
+          .createIndex("embeddingVersion", "embeddingVersion");
       }
       // Existing likedAt values are indexed automatically; preserve all activity.
       const posts = req.transaction!.objectStore("posts");
@@ -104,8 +114,14 @@ function done(tx: IDBTransaction): Promise<void> {
   });
 }
 export async function saveEvents(events: ActivityEvent[]): Promise<void> {
+  // Hash before opening the transaction: asynchronous hashing would let IDB auto-commit.
+  const keys = await Promise.all(
+    events.map((event) =>
+      event.post ? snapshotKey(event.post.text) : undefined,
+    ),
+  );
   const tx = (await database()).transaction(
-    ["events", "posts", "accounts", "meta"],
+    ["events", "posts", "accounts", "meta", "texts"],
     "readwrite",
   );
   const completed = done(tx);
@@ -120,7 +136,9 @@ export async function saveEvents(events: ActivityEvent[]): Promise<void> {
         next();
         return;
       }
-      tx.objectStore("events").put(event);
+      tx.objectStore("events").put(
+        storeSnapshot(tx, event, keys[position - 1]),
+      );
       if (event.kind === "like" || event.kind === "unlike")
         tx.objectStore("meta").put(crypto.randomUUID(), "revision");
       if (!event.post) {
@@ -397,11 +415,11 @@ export async function activitySummary(): Promise<{
 }
 export async function clearActivity(): Promise<void> {
   const tx = (await database()).transaction(
-    ["events", "posts", "accounts", "meta"],
+    ["events", "posts", "accounts", "meta", "texts"],
     "readwrite",
   );
   const completed = done(tx);
-  for (const name of ["events", "posts", "accounts", "meta"])
+  for (const name of ["events", "posts", "accounts", "meta", "texts"])
     tx.objectStore(name).clear();
   tx.objectStore("meta").put(crypto.randomUUID(), "revision");
   await completed;
@@ -414,16 +432,24 @@ export async function exportActivity(): Promise<Blob> {
       exportedAt: new Date().toISOString(),
     }) + "\n",
   ];
-  const tx = (await database()).transaction(["events", "posts", "accounts"]);
+  const tx = (await database()).transaction([
+    "events",
+    "posts",
+    "accounts",
+    "texts",
+  ]);
   const completed = done(tx);
   for (const name of ["events", "posts", "accounts"]) {
     const cursor = tx.objectStore(name).openCursor();
     cursor.onsuccess = () => {
       if (cursor.result) {
-        chunks.push(
-          JSON.stringify({ type: name, data: cursor.result.value }) + "\n",
-        );
-        cursor.result.continue();
+        const entry = cursor.result;
+        const append = (data: unknown) => {
+          chunks.push(JSON.stringify({ type: name, data }) + "\n");
+          entry.continue();
+        };
+        if (name === "events") restoreSnapshot(tx, entry.value, append);
+        else append(entry.value);
       }
     };
   }

@@ -1,3 +1,4 @@
+import { restoreSnapshot } from "./snapshots";
 import type { ActivityEvent } from "./model";
 import { database } from "./database";
 
@@ -171,6 +172,7 @@ export async function dashboardSummary(
       after,
       cancelled,
       500,
+      false,
     );
     page.rows.forEach(accumulator.add);
     after = page.next;
@@ -223,12 +225,13 @@ async function readEventPage(
   after: EventCursor | undefined,
   cancelled: () => boolean,
   pageSize: number,
+  includeText = true,
 ): Promise<EventPage> {
   const keyRange = range({
     ...filter,
     to: Math.min(filter.to, after?.at ?? filter.to),
   });
-  const tx = (await database()).transaction("events");
+  const tx = (await database()).transaction(["events", "texts"]);
   return new Promise((resolve, reject) => {
     const rows: ActivityEvent[] = [];
     let scanned = 0;
@@ -261,12 +264,16 @@ async function readEventPage(
           return;
         }
       }
-      if (matchesRecord(event, filter)) rows.push(event);
-      if (rows.length >= pageSize || ++scanned >= 2000) {
-        resolve({ rows, next: { at: event.at, id: event.id } });
-        return;
-      }
-      cursor.continue();
+      const accept = (restored: ActivityEvent) => {
+        if (matchesRecord(restored, filter)) rows.push(restored);
+        if (rows.length >= pageSize || ++scanned >= 2000) {
+          resolve({ rows, next: { at: event.at, id: event.id } });
+          return;
+        }
+        cursor.continue();
+      };
+      if (includeText) restoreSnapshot(tx, event, accept);
+      else accept(event);
     };
   });
 }
