@@ -1,3 +1,4 @@
+import { readNewsState, newsMatcher } from "./news";
 import { restoreSnapshot } from "./snapshots";
 import type { ActivityEvent } from "./model";
 import { database } from "./database";
@@ -154,6 +155,7 @@ export async function dashboardSummary(
 ): Promise<DashboardSummary> {
   range(filter);
   const accumulator = createSummary(filter);
+  const matchesNews = newsMatcher((await readNewsState()).catalog);
   // Separate short transactions let queued activity writes proceed between batches.
   // These live statistics may include activity committed while the scan is in progress.
   let after: EventCursor | undefined;
@@ -174,6 +176,7 @@ export async function dashboardSummary(
       cancelled,
       500,
       false,
+      matchesNews,
     );
     page.rows.forEach(accumulator.add);
     after = page.next;
@@ -220,7 +223,14 @@ export async function dashboardRecords(
   after?: EventCursor,
   cancelled = () => false,
 ): Promise<EventPage> {
-  return readEventPage(filter, after, cancelled, 50);
+  return readEventPage(
+    filter,
+    after,
+    cancelled,
+    50,
+    true,
+    newsMatcher((await readNewsState()).catalog),
+  );
 }
 async function readEventPage(
   filter: RecordFilter,
@@ -228,6 +238,7 @@ async function readEventPage(
   cancelled: () => boolean,
   pageSize: number,
   includeText = true,
+  matchesNews: (url: string) => boolean = () => false,
 ): Promise<EventPage> {
   const keyRange = range({
     ...filter,
@@ -267,7 +278,11 @@ async function readEventPage(
         }
       }
       const accept = (restored: ActivityEvent) => {
-        if (matchesRecord(restored, filter)) rows.push(restored);
+        if (
+          (restored.kind !== "visit" || matchesNews(restored.url)) &&
+          matchesRecord(restored, filter)
+        )
+          rows.push(restored);
         if (rows.length >= pageSize || ++scanned >= 2000) {
           resolve({ rows, next: { at: event.at, id: event.id } });
           return;

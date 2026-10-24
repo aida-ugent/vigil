@@ -1,3 +1,4 @@
+import { newsMatcher, type NewsCatalog } from "./news";
 import { database, saveEvents } from "./database";
 import { snapshotKey, storeSnapshot, type StoredEvent } from "./snapshots";
 
@@ -129,4 +130,52 @@ export function maintainActivity(): Promise<void> {
   })().finally(() => {
     running = undefined;
   }));
+}
+
+/** Remove legacy non-news visits only after a valid catalog is available. */
+export async function pruneNonNewsVisits(catalog: NewsCatalog): Promise<void> {
+  const db = await database();
+  if (
+    (await read(
+      db.transaction("meta").objectStore("meta").get("newsVisitsVersion"),
+    )) === catalog.version
+  )
+    return;
+  const matches = newsMatcher(catalog);
+  let after: IDBValidKey | undefined;
+  let more: boolean;
+  do {
+    more = false;
+    let scanned = 0;
+    const tx = db.transaction("events", "readwrite");
+    const finished = complete(tx);
+    const req = tx
+      .objectStore("events")
+      .index("kind")
+      .openCursor(IDBKeyRange.only("visit"));
+    req.onsuccess = () => {
+      const cursor = req.result;
+      if (!cursor) return;
+      if (after && indexedDB.cmp(cursor.primaryKey, after) < 0) {
+        cursor.continuePrimaryKey("visit", after);
+        return;
+      }
+      if (after && indexedDB.cmp(cursor.primaryKey, after) === 0) {
+        cursor.continue();
+        return;
+      }
+      if (!matches(cursor.value.url)) cursor.delete();
+      if (++scanned >= BATCH) {
+        after = cursor.primaryKey;
+        more = true;
+        return;
+      }
+      cursor.continue();
+    };
+    await finished;
+    if (more) await new Promise((resolve) => setTimeout(resolve, 0));
+  } while (more);
+  const tx = db.transaction("meta", "readwrite");
+  tx.objectStore("meta").put(catalog.version, "newsVisitsVersion");
+  await complete(tx);
 }

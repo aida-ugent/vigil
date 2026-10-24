@@ -1,6 +1,7 @@
 import { eng } from "stopword";
 import { z } from "zod";
 
+export const NEWS_CATALOG_KEY = "newsCatalogV1";
 export const ACTIVITY_SETTINGS_KEY = "vigilActivitySettingsV1";
 export interface ActivitySettings {
   tracking: boolean;

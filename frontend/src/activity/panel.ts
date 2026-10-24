@@ -12,11 +12,14 @@ export function initializeActivityPanel(onInvalidated: () => void): void {
   const tracking = document.querySelector<HTMLInputElement>(
     "#track-interactions",
   )!;
+  const dashboard = document.querySelector<HTMLButtonElement>("#activity-browse")!;
   const status = document.querySelector<HTMLElement>("#activity-status")!;
   const accounts = document.querySelector<HTMLElement>("#activity-accounts")!;
   async function render(): Promise<void> {
     const settings = await getActivitySettings();
     tracking.checked = settings.tracking;
+    dashboard.classList.toggle("btn-accent", settings.tracking);
+    dashboard.classList.toggle("btn-ghost", !settings.tracking);
     const confirmationEnabled = (
       await getSettings()
     ).selectedBrowserPlugins.includes(CONFIRMATION_PLUGIN_ID);
@@ -58,7 +61,7 @@ export function initializeActivityPanel(onInvalidated: () => void): void {
         });
     });
   }
-  document.querySelector("#activity-browse")!.addEventListener("click", () => {
+  dashboard.addEventListener("click", () => {
     void chrome.tabs
       .create({ url: chrome.runtime.getURL("src/activity/index.html") })
       .catch(fail);

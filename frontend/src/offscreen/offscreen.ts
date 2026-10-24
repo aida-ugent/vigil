@@ -1,4 +1,4 @@
-import * as webllm from "@mlc-ai/web-llm";
+import type { MLCEngineInterface } from "@mlc-ai/web-llm";
 import { drain, embed } from "../activity/embedding";
 import { EmbeddingBackfill } from "../activity/backfill";
 import { getSettings } from "../shared/settingsStorage";
@@ -10,7 +10,7 @@ import {
   type OffscreenResponseMessage,
 } from "./messages";
 
-let engine: webllm.MLCEngineInterface | null = null;
+let engine: MLCEngineInterface | null = null;
 let currentModelId: string | null = null;
 
 function sendEvent(event: RuntimeEventMessage): void {
@@ -70,7 +70,9 @@ async function initModel(modelId: string): Promise<void> {
   }
 
   sendProgress(0.03, "Starting WebLLM engine...");
-  engine = await webllm.CreateMLCEngine(modelId, {
+  // Embedding-only sessions do not need to load the WebLLM runtime.
+  const { CreateMLCEngine } = await import("@mlc-ai/web-llm");
+  engine = await CreateMLCEngine(modelId, {
     initProgressCallback(report) {
       const progress =
         typeof report.progress === "number" ? report.progress : 0;

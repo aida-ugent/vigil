@@ -1,5 +1,6 @@
 import { snapshotKey, storeSnapshot, restoreSnapshot } from "./snapshots";
 import {
+  NEWS_CATALOG_KEY,
   tokens,
   evidenceReady,
   isOwnPost,
@@ -539,9 +540,15 @@ export async function clearActivity(): Promise<void> {
     "readwrite",
   );
   const completed = done(tx);
-  for (const name of ["events", "posts", "accounts", "meta", "texts"])
-    tx.objectStore(name).clear();
-  tx.objectStore("meta").put(crypto.randomUUID(), "revision");
+  const catalog = tx.objectStore("meta").get(NEWS_CATALOG_KEY);
+  catalog.onsuccess = () => {
+    for (const name of ["events", "posts", "accounts", "meta", "texts"])
+      tx.objectStore(name).clear();
+    tx.objectStore("meta").put(crypto.randomUUID(), "revision");
+    // The public domain catalog contains no personal history.
+    if (catalog.result)
+      tx.objectStore("meta").put(catalog.result, NEWS_CATALOG_KEY);
+  };
   await completed;
 }
 export async function exportActivity(): Promise<Blob> {

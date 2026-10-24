@@ -1,3 +1,5 @@
+import { newsCatalog } from "./news";
+import { pruneNonNewsVisits } from "./maintenance";
 import { maintainActivity } from "./maintenance";
 import {
   isRuntimeRequestMessage,
@@ -22,6 +24,21 @@ function enqueue<T>(work: () => Promise<T>): Promise<T> {
 chrome.runtime.onMessage.addListener(
   (message: unknown, sender, sendResponse) => {
     if (!isRuntimeRequestMessage(message)) return;
+    if (message.type === "NEWS_CATALOG_REFRESH") {
+      if (
+        sender.id !== chrome.runtime.id ||
+        sender.tab?.incognito ||
+        !sender.url?.startsWith(chrome.runtime.getURL(""))
+      )
+        return;
+      void refreshNews(message.payload.force).then(
+        () =>
+          sendResponse({ type: "NEWS_CATALOG_RESULT", payload: { ok: true } }),
+        () =>
+          sendResponse({ type: "NEWS_CATALOG_RESULT", payload: { ok: false } }),
+      );
+      return true;
+    }
     const respond = (
       payload: RuntimeResponseMap["ACTIVITY_BATCH"]["payload"],
     ): void => {
@@ -71,13 +88,21 @@ chrome.runtime.onMessage.addListener(
   },
 );
 
-async function visit(tabId: number, url: string, id: string): Promise<void> {
+export async function recordNewsVisit(
+  tabId: number,
+  url: string,
+  id: string,
+): Promise<void> {
   const normalized = cleanUrl(url);
   if (!normalized) return;
   await enqueue(async () => {
-    if (!(await getActivitySettings()).tracking) return;
+    if (
+      !(await getActivitySettings()).tracking ||
+      !(await newsCatalog.matches(normalized))
+    )
+      return;
     const tab = await chrome.tabs.get(tabId);
-    if (tab.incognito) return;
+    if (tab.incognito || cleanUrl(tab.url ?? "") !== normalized) return;
     const event: ActivityEvent = {
       id: crypto.randomUUID(),
       kind: "visit",
@@ -91,7 +116,7 @@ async function visit(tabId: number, url: string, id: string): Promise<void> {
 }
 chrome.webNavigation.onCommitted.addListener((details) => {
   if (details.frameId === 0)
-    void visit(
+    void recordNewsVisit(
       details.tabId,
       details.url,
       details.documentId ?? crypto.randomUUID(),
@@ -101,7 +126,7 @@ chrome.webNavigation.onCommitted.addListener((details) => {
 });
 chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
   if (details.frameId === 0)
-    void visit(
+    void recordNewsVisit(
       details.tabId,
       details.url,
       details.documentId ?? crypto.randomUUID(),
@@ -121,7 +146,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
     .then((tabs) => {
       const tab = tabs[0];
       if (tab?.id && tab.url)
-        return visit(tab.id, tab.url, crypto.randomUUID());
+        return recordNewsVisit(tab.id, tab.url, crypto.randomUUID());
     })
     .catch((error) =>
       console.warn("[Vigil activity] Failed to record navigation", error),
@@ -157,3 +182,18 @@ void chrome.alarms
   .catch((error) =>
     console.warn("[Vigil activity] Maintenance could not be scheduled", error),
   );
+
+async function refreshNews(force = false): Promise<void> {
+  const state = await newsCatalog.refresh(force);
+  if (state.catalog) await pruneNonNewsVisits(state.catalog);
+}
+chrome.runtime.onInstalled.addListener(() => {
+  void refreshNews(true).catch((error) =>
+    console.warn("[Vigil news] Could not refresh news list", error),
+  );
+});
+chrome.runtime.onStartup.addListener(() => {
+  void refreshNews().catch((error) =>
+    console.warn("[Vigil news] Could not refresh news list", error),
+  );
+});

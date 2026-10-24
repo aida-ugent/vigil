@@ -2683,3 +2683,343 @@ test("legacy unlike cleanup removes reversed likes while keeping subsequent re-l
   assert.deepEqual(await activityStoreRows("posts"), []);
   assert.deepEqual(await activityStoreRows("accounts"), []);
 });
+
+const newsCsv = (count = 120) =>
+  "domain\n" +
+  [
+    "bbc.com",
+    "bbc.co.uk",
+    "foxnews.com",
+    ...Array.from({ length: count }, (_, i) => `news-test-${i}.com`),
+  ].join("\n");
+
+test("news catalog normalizes domains and matches real subdomains without public-suffix or lookalike matches", async () => {
+  const { parseNewsDomains, newsMatcher } = await import(
+    "../src/activity/news"
+  );
+  const domains = parseNewsDomains(
+    newsCsv() + "\nWWW.BBC.COM\nco.uk\nblogspot.com\nhttps://example.com/path",
+  );
+  assert.equal(domains.filter((domain) => domain === "bbc.com").length, 1);
+  assert.ok(!domains.includes("co.uk") && !domains.includes("blogspot.com"));
+  const matches = newsMatcher({ domains, fetchedAt: 1, version: "1" });
+  for (const url of [
+    "https://bbc.com/news",
+    "https://www.bbc.com/news",
+    "https://news.bbc.co.uk/article",
+    "http://foxnews.com/story",
+  ])
+    assert.equal(matches(url), true, url);
+  for (const url of [
+    "https://bbc.com.evil.com",
+    "https://notbbc.com",
+    "https://other.co.uk",
+    "https://bbc.com@evil.com",
+    "ftp://bbc.com",
+    "https://wikipedia.org",
+    "https://x.com/home",
+  ])
+    assert.equal(matches(url), false, url);
+  assert.equal(newsMatcher()("https://bbc.com"), false);
+  assert.throws(() => parseNewsDomains("<html>error</html>"));
+  assert.throws(() => parseNewsDomains("domain\nbbc.com"));
+});
+
+test("news catalog caches locally, coalesces refreshes, and retains the last valid list after failures", async () => {
+  const { NewsCatalogService } = await import("../src/activity/news");
+  let state: import("../src/activity/news").NewsCatalogState = {};
+  let now = Date.UTC(2026, 9, 24);
+  let calls = 0,
+    fail = false;
+  const requests: Array<{ url: string; options?: RequestInit }> = [];
+  const service = new NewsCatalogService({
+    read: async () => structuredClone(state),
+    write: async (value) => {
+      state = structuredClone(value);
+    },
+    now: () => now,
+    fetch: async (input, options) => {
+      const url = String(input);
+      calls++;
+      requests.push({ url, options });
+      if (fail) throw new Error("Offline");
+      return url.includes("/commits?")
+        ? Response.json([{ sha: "a".repeat(40) }])
+        : new Response(newsCsv());
+    },
+  });
+  assert.equal(await service.matches("https://bbc.com"), false);
+  await Promise.all([service.refresh(), service.refresh()]);
+  assert.equal(calls, 2);
+  assert.equal(
+    await service.matches("https://bbc.com/news/private-title"),
+    true,
+  );
+  assert.equal(await service.matches("https://unlisted.example"), false);
+  await service.refresh();
+  assert.equal(calls, 2, "fresh cached list needs no requests");
+  assert.ok(
+    requests.every(
+      ({ url, options }) =>
+        /^https:\/\/(api.github.com|raw.githubusercontent.com)\//.test(url) &&
+        !url.includes("private-title") &&
+        options?.credentials === "omit" &&
+        options.referrerPolicy === "no-referrer",
+    ),
+  );
+  now += 31 * 86400000;
+  await service.refresh();
+  assert.equal(calls, 3, "unchanged revision needs only the metadata request");
+  assert.equal(state.catalog!.fetchedAt, now);
+  now += 31 * 86400000;
+  fail = true;
+  const previous = structuredClone(state.catalog);
+  await service.refresh();
+  assert.equal(calls, 4);
+  assert.deepEqual(state.catalog, previous);
+  assert.ok(state.error);
+  assert.equal(await service.matches("https://bbc.com"), true);
+  await service.refresh();
+  assert.equal(calls, 4, "failed updates are throttled");
+});
+
+for (const problem of [
+  "revision",
+  "metadata",
+  "empty",
+  "oversized",
+  "shrink",
+] as const) {
+  test(`news catalog rejects ${problem} update without replacing saved domains`, async () => {
+    const { NewsCatalogService } = await import("../src/activity/news");
+    let state: import("../src/activity/news").NewsCatalogState = {
+      catalog: {
+        version: "old",
+        fetchedAt: 0,
+        domains: [
+          "bbc.com",
+          ...Array.from({ length: 500 }, (_, i) => `paper-${i}.com`),
+        ],
+      },
+    };
+    const original = structuredClone(state.catalog);
+    const service = new NewsCatalogService({
+      read: async () => structuredClone(state),
+      write: async (value) => {
+        state = value;
+      },
+      now: () => Date.UTC(2026, 9, 24),
+      fetch: async (input) =>
+        String(input).includes("/commits?")
+          ? Response.json(
+              problem === "metadata"
+                ? { message: "rate limited" }
+                : [
+                    {
+                      sha:
+                        problem === "revision" ? "../../other" : "b".repeat(40),
+                    },
+                  ],
+            )
+          : new Response(
+              problem === "empty"
+                ? "domain\n"
+                : problem === "oversized"
+                  ? "x".repeat(2_000_001)
+                  : newsCsv(),
+            ),
+    });
+    await service.refresh();
+    assert.ok(state.error);
+    assert.deepEqual(state.catalog, original);
+  });
+}
+
+test("news-only dashboard filters legacy visits and cleanup retains X and recognized news", async () => {
+  const { database } = await import("../src/activity/database");
+  const { pruneNonNewsVisits } = await import("../src/activity/maintenance");
+  const { dashboardSummary, dashboardRecords } = await import(
+    "../src/activity/analytics"
+  );
+  const { NEWS_CATALOG_KEY } = await import("../src/activity/model");
+  const { readNewsState } = await import("../src/activity/news");
+  await clearActivity();
+  const catalog = {
+    domains: ["bbc.com"],
+    version: "fixture-1",
+    fetchedAt: Date.now(),
+  };
+  const tx = (await database()).transaction("meta", "readwrite");
+  const done = new Promise<void>((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onabort = () => reject(tx.error);
+  });
+  tx.objectStore("meta").put({ catalog }, NEWS_CATALOG_KEY);
+  await done;
+  const visit = (url: string): ActivityEvent => ({
+    id: crypto.randomUUID(),
+    kind: "visit",
+    url,
+    at: 1000,
+    session: "news-test",
+  });
+  const news = visit("https://www.bbc.com/news/story");
+  const liked = event("like", "970", 1000);
+  await saveEvents([
+    news,
+    ...Array.from({ length: 450 }, () => visit("https://not-news.example")),
+    liked,
+  ]);
+  const filter = {
+    from: 0,
+    to: 2000,
+    viewer: "",
+    surface: "all" as const,
+    kind: "all" as const,
+    author: "",
+    query: "",
+    day: "",
+    domain: "",
+  };
+  const summary = await dashboardSummary(filter);
+  assert.equal(summary.visits, 1);
+  assert.equal(summary.likedPosts, 1);
+  assert.deepEqual(
+    new Set((await dashboardRecords(filter)).rows.map((row) => row.id)),
+    new Set([news.id, liked.id]),
+  );
+  await pruneNonNewsVisits(catalog);
+  const remaining = await activityStoreRows("events");
+  assert.deepEqual(
+    new Set(remaining.map((row) => row.id)),
+    new Set([news.id, liked.id]),
+  );
+  await clearActivity();
+  assert.deepEqual(
+    (await readNewsState()).catalog,
+    catalog,
+    "public list survives deleting personal history",
+  );
+  assert.equal((await activityStoreRows("events")).length, 0);
+});
+
+test("visit collection saves only recognized news and excludes paused, incognito and stale navigations", async () => {
+  await clearActivity();
+  const { database } = await import("../src/activity/database");
+  const { NEWS_CATALOG_KEY } = await import("../src/activity/model");
+  const tx = (await database()).transaction("meta", "readwrite");
+  const stored = new Promise<void>((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onabort = () => reject(tx.error);
+  });
+  tx.objectStore("meta").put(
+    {
+      catalog: {
+        domains: ["bbc.com"],
+        fetchedAt: Date.now(),
+        version: "collector-fixture",
+      },
+    },
+    NEWS_CATALOG_KEY,
+  );
+  await stored;
+  let tracking = true,
+    incognito = false;
+  let tabUrl = "https://www.bbc.com/news/story?tracking=1";
+  Object.defineProperty(globalThis, "chrome", {
+    configurable: true,
+    value: {
+      runtime: {
+        id: "test-extension",
+        getURL: (path: string) => `chrome-extension://test-extension/${path}`,
+        onMessage: { addListener() {} },
+        onInstalled: { addListener() {} },
+        onStartup: { addListener() {} },
+      },
+      tabs: {
+        get: async () => ({ url: tabUrl, title: "News story", incognito }),
+      },
+      storage: {
+        local: { get: async () => ({ vigilActivitySettingsV1: { tracking } }) },
+        onChanged: { addListener() {} },
+      },
+      alarms: {
+        get: async () => ({ name: "vigil-activity-maintenance" }),
+        onAlarm: { addListener() {} },
+      },
+      webNavigation: {
+        onCommitted: { addListener() {} },
+        onHistoryStateUpdated: { addListener() {} },
+      },
+    },
+  });
+  const { recordNewsVisit } = await import("../src/activity/background");
+  await recordNewsVisit(1, tabUrl, "news-session");
+  await recordNewsVisit(
+    1,
+    "https://ordinary.example/private",
+    "ordinary-session",
+  );
+  await recordNewsVisit(1, "https://x.com/home", "x-session");
+  incognito = true;
+  await recordNewsVisit(1, tabUrl, "incognito");
+  incognito = false;
+  tracking = false;
+  await recordNewsVisit(1, tabUrl, "paused");
+  tracking = true;
+  tabUrl = "https://ordinary.example/now";
+  await recordNewsVisit(1, "https://www.bbc.com/news/story", "stale");
+  const records = await activityStoreRows("events");
+  assert.equal(records.length, 1);
+  assert.equal(records[0].kind, "visit");
+  assert.equal(records[0].url, "https://www.bbc.com/news/story");
+});
+
+test("share charts preserve the full total, group the tail, and safely drill into named sources", async () => {
+  const { renderShare } = await import("../src/activity/charts");
+  const previousDocument = globalThis.document;
+  const dom = new JSDOM("<div id='chart'></div>");
+  Object.defineProperty(globalThis, "document", {
+    value: dom.window.document,
+    configurable: true,
+  });
+  try {
+    const chart = document.getElementById("chart")!;
+    let selected = "";
+    const data = Array.from({ length: 6 }, (_, i) => ({
+      key: String(i),
+      label: i === 0 ? "<img src=x>" : String(i),
+      value: 10,
+    }));
+    renderShare(chart, data, 100, "views", (key) => {
+      selected = key;
+    });
+    assert.equal(chart.querySelector("img"), null);
+    assert.equal(chart.querySelectorAll("button").length, 5);
+    assert.match(
+      chart.querySelector(".share-legend")!.textContent!,
+      /Other50%/,
+    );
+    assert.match(
+      chart.querySelector("button")!.getAttribute("aria-label")!,
+      /10 \(10%\)/,
+    );
+    chart.querySelector("button")!.click();
+    assert.equal(selected, "0");
+    assert.equal(
+      chart.querySelector(".share-center strong")!.textContent,
+      "100",
+    );
+    renderShare(chart, data.slice(0, 1), 10, "views", () => {});
+    assert.doesNotMatch(chart.textContent!, /Other/);
+    assert.match(chart.textContent!, /100%/);
+    renderShare(chart, [], 0, "views", () => {});
+    assert.equal(chart.childElementCount, 0);
+  } finally {
+    Object.defineProperty(globalThis, "document", {
+      value: previousDocument,
+      configurable: true,
+    });
+    dom.window.close();
+  }
+});

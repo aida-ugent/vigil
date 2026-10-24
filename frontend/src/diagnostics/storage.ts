@@ -1,3 +1,4 @@
+import { readNewsState } from "../activity/news";
 import { database } from "../activity/database";
 import { EMBEDDING_DIMS, EMBEDDING_VERSION } from "../activity/model";
 
@@ -32,10 +33,11 @@ export async function storageDiagnostics() {
           .count(EMBEDDING_VERSION),
       ),
     ]);
-  const [localBytes, analysisBytes, estimate] = await Promise.all([
+  const [localBytes, analysisBytes, estimate, news] = await Promise.all([
     chrome.storage.local.getBytesInUse(null),
     chrome.storage.local.getBytesInUse("vigil_analysis_cache_v1"),
     navigator.storage?.estimate?.().catch(() => undefined),
+    readNewsState(),
   ]);
   return {
     visits,
@@ -45,6 +47,8 @@ export async function storageDiagnostics() {
     accounts,
     snapshots,
     vectors,
+    newsDomains: news.catalog?.domains.length ?? 0,
+    newsUpdatedAt: news.catalog?.fetchedAt,
     vectorBytes: vectors * EMBEDDING_DIMS * Float32Array.BYTES_PER_ELEMENT,
     localBytes,
     analysisBytes,
@@ -83,7 +87,8 @@ export function createStorageDiagnostics(): HTMLElement {
         `  Analysis cache: ${mib(data.analysisBytes)} (included above)`,
         "Web storage includes IndexedDB and model caches; installed extension files and RAM are excluded. These figures are not a single combined total.",
         "",
-        `Website visits: ${data.visits.toLocaleString()}`,
+        `Cached news domains: ${data.newsDomains.toLocaleString()}${data.newsUpdatedAt ? ` (updated ${new Date(data.newsUpdatedAt).toLocaleDateString()})` : " (not downloaded)"}`,
+        `Stored visit records: ${data.visits.toLocaleString()}`,
         `X exposure events: ${data.exposures.toLocaleString()}`,
         `Saved likes: ${data.likes.toLocaleString()}`,
         `Stored X posts: ${data.posts.toLocaleString()}`,

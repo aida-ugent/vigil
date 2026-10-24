@@ -1343,3 +1343,9 @@ body {
   font: 11px/1.5 var(--font-mono);
   color: var(--text-2);
 }
+
+.dashboard-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}

@@ -1,3 +1,5 @@
+import { readNewsState } from "./news";
+import { sendRuntimeMessage } from "../shared/messages";
 import "./browser.css";
 import type {
   DashboardFilter,
@@ -6,7 +8,7 @@ import type {
   EventCursor,
 } from "./analytics";
 import { AnalyticsClient } from "./analyticsClient";
-import { renderBars } from "./charts";
+import { renderBars, renderShare } from "./charts";
 import type { ActivityEvent } from "./model";
 
 const el = <T extends HTMLElement = HTMLElement>(id: string) =>
@@ -79,6 +81,31 @@ function renderCharts() {
       .sort((a, b) => b[metric] - a[metric] || a.author.localeCompare(b.author))
       .slice(0, limit)
       .map((a) => ({ key: a.author, label: `@${a.author}`, value: a[metric] }));
+  renderShare(
+    el("seen-share"),
+    ranked(measure),
+    summary[measure],
+    measure === "exposures" ? "views" : "unique posts",
+    (author) => selectRecords("exposure", author),
+  );
+  renderShare(
+    el("liked-share"),
+    ranked("likedPosts"),
+    summary.likedPosts,
+    "saved likes",
+    (author) => selectRecords("like", author),
+  );
+  renderShare(
+    el("domain-share"),
+    summary.domains.map((d) => ({
+      key: d.domain,
+      label: d.domain,
+      value: d.visits,
+    })),
+    summary.visits,
+    "news visits",
+    (domain) => selectRecords("visit", "", "", domain),
+  );
   renderBars(el("seen-chart"), ranked(measure), summary[measure], (author) =>
     selectRecords("exposure", author),
   );
@@ -154,7 +181,7 @@ function renderTimeline() {
 function appendRow(event: ActivityEvent) {
   const tr = document.createElement("tr");
   const labels = {
-    visit: "Website visit",
+    visit: "News-site visit",
     exposure: "Post seen",
     like: "Liked",
     unlike: "Unliked",
@@ -272,7 +299,15 @@ async function refresh() {
   selectedDomain = "";
   const generation = ++summaryGeneration;
   summary = undefined;
-  for (const id of ["seen-chart", "liked-chart", "domain-chart", "timeline"])
+  for (const id of [
+    "seen-chart",
+    "liked-chart",
+    "domain-chart",
+    "seen-share",
+    "liked-share",
+    "domain-share",
+    "timeline",
+  ])
     el(id).replaceChildren();
   for (const id of [
     "metric-seen",
@@ -346,3 +381,33 @@ el("clear-selection").addEventListener("click", () => selectRecords("all"));
 el("more").addEventListener("click", () => void loadRecords(false));
 window.addEventListener("pagehide", () => client.dispose());
 void refresh();
+
+async function updateNewsList(force = false): Promise<void> {
+  const button = el<HTMLButtonElement>("refresh-news-list");
+  button.disabled = true;
+  const status = el("news-catalog-status");
+  try {
+    const existing = await readNewsState();
+    status.textContent = existing.catalog
+      ? `${existing.catalog.domains.length.toLocaleString()} news domains cached. Checking for updates…`
+      : "Loading the news-site list. X tracking remains available.";
+    await sendRuntimeMessage({
+      type: "NEWS_CATALOG_REFRESH",
+      payload: { force },
+    });
+    const state = await readNewsState();
+    status.textContent = state.catalog
+      ? `${state.catalog.domains.length.toLocaleString()} domains · updated ${new Date(state.catalog.fetchedAt).toLocaleDateString()}.${state.error ? " Update unavailable; using the saved list." : ""}`
+      : "News-site list unavailable. News visits are not saved until a list is downloaded; X tracking is unaffected.";
+    await refresh();
+  } catch {
+    status.textContent =
+      "Could not refresh the news-site list. Any saved list remains in use.";
+  } finally {
+    button.disabled = false;
+  }
+}
+el("refresh-news-list").addEventListener("click", () => {
+  void updateNewsList(true);
+});
+void updateNewsList();

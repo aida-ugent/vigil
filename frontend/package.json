@@ -30,6 +30,12 @@
     "@huggingface/transformers": "^4.3.1",
     "@mlc-ai/web-llm": "^0.2.86",
     "stopword": "^3.1.5",
+    "tldts": "^7.4.19",
     "zod": "^4.6.7"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true,
+    "protobufjs@7.6.6": true,
+    "onnxruntime-node": false
   }
 }

@@ -31,6 +31,7 @@ export interface ProxyFetchResult {
 export type RuntimeRequestMessage =
   | { type: "ACTIVITY_BATCH"; payload: { events: ActivityEvent[] } }
   | { type: "ACTIVITY_CLEAR" }
+  | { type: "NEWS_CATALOG_REFRESH"; payload: { force: boolean } }
   | { type: "PING" }
   | { type: "GET_ACTIVE_TAB" }
   | { type: "CONTENT_READY"; payload: { tabId: number | null; url: string } }
@@ -146,6 +147,10 @@ export type RuntimeResponseMap = {
     type: "ACTIVITY_ACK";
     payload: { ok: boolean; error?: string };
   };
+  NEWS_CATALOG_REFRESH: {
+    type: "NEWS_CATALOG_RESULT";
+    payload: { ok: boolean };
+  };
   ACTIVITY_CLEAR: {
     type: "ACTIVITY_ACK";
     payload: { ok: boolean; error?: string };
@@ -259,6 +264,10 @@ const runtimeRequestSchema = z.discriminatedUnion("type", [
     payload: z.object({ events: z.array(eventSchema).max(50) }),
   }),
   z.object({ type: z.literal("ACTIVITY_CLEAR") }),
+  z.object({
+    type: z.literal("NEWS_CATALOG_REFRESH"),
+    payload: z.object({ force: z.boolean() }),
+  }),
   z.object({ type: z.literal("PING") }),
   z.object({ type: z.literal("GET_ACTIVE_TAB") }),
   z.object({ type: z.literal("EXTRACT_TWEETS_REQUEST") }),
