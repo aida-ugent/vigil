@@ -272,7 +272,7 @@ test("confirmation detector abstains before readiness and validates spans and ev
 test("activity browser filters by account and content and paginates without duplicates", async () => {
   await clearActivity();
   await saveEvents(
-    Array.from({ length: 70 }, (_, i) => event("exposure", `${1000 + i}`)),
+    Array.from({ length: 70 }, (_, i) => event("like", `${1000 + i}`)),
   );
   const first = await browseActivity({
     kind: "posts",
@@ -385,7 +385,11 @@ test("collector is opt-in, requires dwell, captures media-only posts and stops w
   ]);
   await new Promise((r) => setTimeout(r, 1100));
   assert.equal(batches.length, 1);
-  assert.equal(batches[0][0].post!.text, "A solar panel");
+  assert.equal(
+    batches[0][0].post!.text,
+    "",
+    "media alt text is not retained for exposures",
+  );
   assert.equal(batches[0][0].post!.viewer, "reader");
   onStorage!(
     { vigilActivitySettingsV1: { newValue: { tracking: false } } },
@@ -2362,13 +2366,18 @@ test("shared snapshots preserve historical text, dashboard searches and exports"
     });
   assert.equal(
     await read(db.transaction("texts").objectStore("texts").count()),
-    2,
+    1,
   );
   const stored = await read(
     db.transaction("events").objectStore("events").getAll(),
   );
   assert.equal(stored.length, 4);
-  assert.ok(stored.every((row) => row.post.text === "" && row.textKey));
+  assert.ok(stored.every((row) => row.post.text === ""));
+  assert.ok(
+    stored
+      .filter((row) => row.kind === "exposure")
+      .every((row) => !row.textKey),
+  );
   const filter = {
     from: 0,
     to: 2000,
@@ -2381,7 +2390,7 @@ test("shared snapshots preserve historical text, dashboard searches and exports"
     domain: "",
   };
   const records = await dashboardRecords(filter);
-  assert.equal(records.rows.length, 3);
+  assert.equal(records.rows.length, 1);
   assert.ok(records.rows.every((row) => row.post!.text === first.post!.text));
   const summary = await dashboardSummary(filter);
   assert.equal(summary.exposures, 3);
@@ -2396,21 +2405,27 @@ test("shared snapshots preserve historical text, dashboard searches and exports"
   for (const original of [first, liked, repeat, edited])
     assert.deepEqual(
       events.find((row) => row.id === original.id),
-      original,
+      original.kind === "exposure"
+        ? { ...original, post: { ...original.post, text: "" } }
+        : original,
     );
   const post = exported.find((row) => row.type === "posts").data;
   assert.equal(post.likedText, first.post!.text);
-  assert.equal(post.text, edited.post.text);
+  assert.equal(
+    post.text,
+    liked.post!.text,
+    "exposures cannot overwrite liked content",
+  );
   const short = event("exposure", "701");
   short.post!.text = "Brief post";
   await saveEvents([short]);
   assert.deepEqual(
     await read(db.transaction("events").objectStore("events").get(short.id)),
-    short,
+    { ...short, post: { ...short.post, text: "" } },
   );
   assert.equal(
     await read(db.transaction("texts").objectStore("texts").count()),
-    2,
+    1,
     "short text stays inline without extra records",
   );
   await clearActivity();
@@ -2601,10 +2616,12 @@ test("unlikes retain exposures and shared snapshots but remove like-only text; a
   assert.equal(records.length, 1);
   assert.equal(records[0].id, exposure.id);
   const texts = await activityStoreRows("texts");
-  assert.equal(texts.length, 1);
-  assert.equal(texts[0].text, exposure.post!.text);
+  assert.equal(texts.length, 0);
+  assert.equal(records[0].post.text, "");
   const post = (await activityStoreRows("posts"))[0];
   assert.equal(post.liked, false);
+  assert.equal(post.text, "");
+  assert.deepEqual(post.tokens, []);
   assert.equal(post.likedText, undefined);
   assert.equal(post.likedAt, undefined);
   assert.equal(post.embedding, undefined);
@@ -2613,10 +2630,10 @@ test("unlikes retain exposures and shared snapshots but remove like-only text; a
     .trim()
     .split("\n")
     .map((line) => JSON.parse(line));
-  assert.deepEqual(
-    exported.find((row) => row.type === "events").data,
-    exposure,
-  );
+  assert.deepEqual(exported.find((row) => row.type === "events").data, {
+    ...exposure,
+    post: { ...exposure.post, text: "" },
+  });
   const own = event("like", "921", 2000, "reader");
   await saveEvents([own]);
   await saveEmbeddings([
@@ -2684,25 +2701,38 @@ test("legacy unlike cleanup removes reversed likes while keeping subsequent re-l
   assert.deepEqual(await activityStoreRows("accounts"), []);
 });
 
-const newsCsv = (count = 120) =>
-  "domain\n" +
-  [
+const newsSnapshot = (count = 120) => ({
+  source: "mediacloud",
+  scope: "geographic-publishers-v1",
+  publishedAt: "2026-01-08",
+  version: "mediacloud-curated:" + "a".repeat(64),
+  fetchedAt: Date.UTC(2026, 9, 24),
+  domains: [
     "bbc.com",
     "bbc.co.uk",
     "foxnews.com",
     ...Array.from({ length: count }, (_, i) => `news-test-${i}.com`),
-  ].join("\n");
+  ],
+});
 
-test("news catalog normalizes domains and matches real subdomains without public-suffix or lookalike matches", async () => {
-  const { parseNewsDomains, newsMatcher } = await import(
+test("Media Cloud domains match subdomains but exclude public suffixes and lookalikes", async () => {
+  const { parseNewsCatalog, newsMatcher } = await import(
     "../src/activity/news"
   );
-  const domains = parseNewsDomains(
-    newsCsv() + "\nWWW.BBC.COM\nco.uk\nblogspot.com\nhttps://example.com/path",
+  const fixture = newsSnapshot();
+  fixture.domains.push(
+    "WWW.BBC.COM",
+    "co.uk",
+    "blogspot.com",
+    "https://example.com/path",
   );
-  assert.equal(domains.filter((domain) => domain === "bbc.com").length, 1);
-  assert.ok(!domains.includes("co.uk") && !domains.includes("blogspot.com"));
-  const matches = newsMatcher({ domains, fetchedAt: 1, version: "1" });
+  const catalog = parseNewsCatalog(JSON.stringify(fixture));
+  assert.equal(catalog.domains.filter((d) => d === "bbc.com").length, 1);
+  assert.ok(
+    !catalog.domains.includes("co.uk") &&
+      !catalog.domains.includes("blogspot.com"),
+  );
+  const matches = newsMatcher(catalog);
   for (const url of [
     "https://bbc.com/news",
     "https://www.bbc.com/news",
@@ -2721,119 +2751,119 @@ test("news catalog normalizes domains and matches real subdomains without public
   ])
     assert.equal(matches(url), false, url);
   assert.equal(newsMatcher()("https://bbc.com"), false);
-  assert.throws(() => parseNewsDomains("<html>error</html>"));
-  assert.throws(() => parseNewsDomains("domain\nbbc.com"));
+  assert.throws(() => parseNewsCatalog("<html>error</html>"));
+  assert.throws(() =>
+    parseNewsCatalog(JSON.stringify({ ...fixture, scope: "all-sources" })),
+  );
+  assert.throws(() =>
+    parseNewsCatalog(JSON.stringify({ ...fixture, source: "old-provider" })),
+  );
+  assert.throws(() =>
+    parseNewsCatalog(JSON.stringify({ ...fixture, domains: ["bbc.com"] })),
+  );
 });
 
-test("news catalog caches locally, coalesces refreshes, and retains the last valid list after failures", async () => {
+test("Media Cloud refresh uses one backend request; navigation is local and failures preserve the cache", async () => {
   const { NewsCatalogService } = await import("../src/activity/news");
   let state: import("../src/activity/news").NewsCatalogState = {};
-  let now = Date.UTC(2026, 9, 24);
-  let calls = 0,
-    fail = false;
+  let fail = false;
   const requests: Array<{ url: string; options?: RequestInit }> = [];
   const service = new NewsCatalogService({
     read: async () => structuredClone(state),
     write: async (value) => {
       state = structuredClone(value);
     },
-    now: () => now,
+    now: () => Date.UTC(2026, 9, 24),
+    endpoint: async () => "http://localhost:8787/news/sources",
     fetch: async (input, options) => {
-      const url = String(input);
-      calls++;
-      requests.push({ url, options });
+      requests.push({ url: String(input), options });
       if (fail) throw new Error("Offline");
-      return url.includes("/commits?")
-        ? Response.json([{ sha: "a".repeat(40) }])
-        : new Response(newsCsv());
+      return Response.json(newsSnapshot());
     },
   });
   assert.equal(await service.matches("https://bbc.com"), false);
   await Promise.all([service.refresh(), service.refresh()]);
-  assert.equal(calls, 2);
+  assert.equal(requests.length, 1);
   assert.equal(
     await service.matches("https://bbc.com/news/private-title"),
     true,
   );
   assert.equal(await service.matches("https://unlisted.example"), false);
-  await service.refresh();
-  assert.equal(calls, 2, "fresh cached list needs no requests");
-  assert.ok(
-    requests.every(
-      ({ url, options }) =>
-        /^https:\/\/(api.github.com|raw.githubusercontent.com)\//.test(url) &&
-        !url.includes("private-title") &&
-        options?.credentials === "omit" &&
-        options.referrerPolicy === "no-referrer",
-    ),
+  assert.equal(requests.length, 1, "matching never makes network requests");
+  assert.equal(requests[0].url, "http://localhost:8787/news/sources");
+  assert.equal(requests[0].options?.credentials, "omit");
+  assert.equal(requests[0].options?.referrerPolicy, "no-referrer");
+  assert.equal(
+    requests[0].options?.headers,
+    undefined,
+    "no Media Cloud key in extension",
   );
-  now += 31 * 86400000;
-  await service.refresh();
-  assert.equal(calls, 3, "unchanged revision needs only the metadata request");
-  assert.equal(state.catalog!.fetchedAt, now);
-  now += 31 * 86400000;
-  fail = true;
   const previous = structuredClone(state.catalog);
+  fail = true;
   await service.refresh();
-  assert.equal(calls, 4);
+  assert.equal(requests.length, 2);
   assert.deepEqual(state.catalog, previous);
   assert.ok(state.error);
   assert.equal(await service.matches("https://bbc.com"), true);
-  await service.refresh();
-  assert.equal(calls, 4, "failed updates are throttled");
 });
 
 for (const problem of [
   "revision",
-  "metadata",
+  "provider",
   "empty",
   "oversized",
   "shrink",
 ] as const) {
-  test(`news catalog rejects ${problem} update without replacing saved domains`, async () => {
-    const { NewsCatalogService } = await import("../src/activity/news");
+  test(`Media Cloud rejects ${problem} without replacing its cache`, async () => {
+    const { NewsCatalogService, parseNewsCatalog } = await import(
+      "../src/activity/news"
+    );
     let state: import("../src/activity/news").NewsCatalogState = {
-      catalog: {
-        version: "old",
-        fetchedAt: 0,
-        domains: [
-          "bbc.com",
-          ...Array.from({ length: 500 }, (_, i) => `paper-${i}.com`),
-        ],
-      },
+      catalog: parseNewsCatalog(JSON.stringify(newsSnapshot(500))),
     };
     const original = structuredClone(state.catalog);
+    const fixture = newsSnapshot();
+    if (problem === "revision") fixture.version = "../../other";
+    if (problem === "provider") fixture.source = "github";
+    if (problem === "empty") fixture.domains = [];
     const service = new NewsCatalogService({
       read: async () => structuredClone(state),
       write: async (value) => {
         state = value;
       },
       now: () => Date.UTC(2026, 9, 24),
-      fetch: async (input) =>
-        String(input).includes("/commits?")
-          ? Response.json(
-              problem === "metadata"
-                ? { message: "rate limited" }
-                : [
-                    {
-                      sha:
-                        problem === "revision" ? "../../other" : "b".repeat(40),
-                    },
-                  ],
-            )
-          : new Response(
-              problem === "empty"
-                ? "domain\n"
-                : problem === "oversized"
-                  ? "x".repeat(2_000_001)
-                  : newsCsv(),
-            ),
+      endpoint: async () => "http://localhost:8787/news/sources",
+      fetch: async () =>
+        new Response(
+          JSON.stringify(fixture),
+          problem === "oversized"
+            ? { headers: { "Content-Length": "64000001" } }
+            : undefined,
+        ),
     });
     await service.refresh();
     assert.ok(state.error);
     assert.deepEqual(state.catalog, original);
   });
 }
+
+test("Media Cloud cache does not reuse the former provider's list", async () => {
+  const { database } = await import("../src/activity/database");
+  const { NEWS_CATALOG_KEY } = await import("../src/activity/model");
+  const { readNewsState } = await import("../src/activity/news");
+  const tx = (await database()).transaction("meta", "readwrite");
+  tx.objectStore("meta").delete(NEWS_CATALOG_KEY);
+  tx.objectStore("meta").put({ catalog: newsSnapshot() }, "newsCatalogV1");
+  tx.objectStore("meta").put(
+    { catalog: newsSnapshot() },
+    "mediaCloudCatalogV1",
+  );
+  await new Promise<void>((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onabort = () => reject(tx.error);
+  });
+  assert.equal((await readNewsState()).catalog, undefined);
+});
 
 test("news-only dashboard filters legacy visits and cleanup retains X and recognized news", async () => {
   const { database } = await import("../src/activity/database");
@@ -2868,6 +2898,11 @@ test("news-only dashboard filters legacy visits and cleanup retains X and recogn
   await saveEvents([
     news,
     ...Array.from({ length: 450 }, () => visit("https://not-news.example")),
+    ...[
+      "https://login.microsoftonline.com",
+      "https://mail.google.com",
+      "https://lichess.org",
+    ].map(visit),
     liked,
   ]);
   const filter = {
@@ -2926,6 +2961,8 @@ test("visit collection saves only recognized news and excludes paused, incognito
   let tracking = true,
     incognito = false;
   let tabUrl = "https://www.bbc.com/news/story?tracking=1";
+  const session: Record<string, unknown> = {};
+  let onRemoved: (tabId: number) => void = () => {};
   Object.defineProperty(globalThis, "chrome", {
     configurable: true,
     value: {
@@ -2937,9 +2974,15 @@ test("visit collection saves only recognized news and excludes paused, incognito
         onStartup: { addListener() {} },
       },
       tabs: {
+        onRemoved: { addListener(listener: typeof onRemoved) { onRemoved = listener; } },
         get: async () => ({ url: tabUrl, title: "News story", incognito }),
       },
       storage: {
+        session: {
+          get: async (key: string) => ({ [key]: session[key] }),
+          set: async (values: Record<string, unknown>) => { Object.assign(session, values); },
+          remove: async (key: string) => { delete session[key]; },
+        },
         local: { get: async () => ({ vigilActivitySettingsV1: { tracking } }) },
         onChanged: { addListener() {} },
       },
@@ -2955,6 +2998,15 @@ test("visit collection saves only recognized news and excludes paused, incognito
   });
   const { recordNewsVisit } = await import("../src/activity/background");
   await recordNewsVisit(1, tabUrl, "news-session");
+  tabUrl = "https://www.bbc.com/news/story?tracking=2#section";
+  await Promise.all(Array.from({ length: 270 }, (_, i) =>
+    recordNewsVisit(1, tabUrl, `reload-${i}`),
+  ));
+  assert.equal((await activityStoreRows("events")).length, 1);
+  // Stored session state is sufficient even without any in-memory tab cache.
+  session["vigilNewsVisitTab:2"] = cleanUrl(tabUrl);
+  await recordNewsVisit(2, tabUrl, "worker-restarted");
+  assert.equal((await activityStoreRows("events")).length, 1);
   await recordNewsVisit(
     1,
     "https://ordinary.example/private",
@@ -2973,6 +3025,18 @@ test("visit collection saves only recognized news and excludes paused, incognito
   assert.equal(records.length, 1);
   assert.equal(records[0].kind, "visit");
   assert.equal(records[0].url, "https://www.bbc.com/news/story");
+
+  tabUrl = "https://www.bbc.com/news/another";
+  await recordNewsVisit(1, tabUrl, "another-article");
+  tabUrl = "https://ordinary.example/";
+  await recordNewsVisit(1, tabUrl, "leave");
+  tabUrl = "https://www.bbc.com/news/another";
+  await recordNewsVisit(1, tabUrl, "return");
+  await recordNewsVisit(3, tabUrl, "separate-tab");
+  assert.equal((await activityStoreRows("events")).length, 4);
+  onRemoved(3);
+  await recordNewsVisit(3, tabUrl, "reused-tab-id");
+  assert.equal((await activityStoreRows("events")).length, 5);
 });
 
 test("share charts preserve the full total, group the tail, and safely drill into named sources", async () => {
@@ -3022,4 +3086,129 @@ test("share charts preserve the full total, group the tail, and safely drill int
     });
     dom.window.close();
   }
+});
+
+test("legacy exposure content cleanup resumes, preserves statistics and shared preference text", async () => {
+  const { database } = await import("../src/activity/database");
+  const { removeExposureContent } = await import("../src/activity/maintenance");
+  const { snapshotKey, storeSnapshot } = await import(
+    "../src/activity/snapshots"
+  );
+  await clearActivity();
+  const exposures = Array.from({ length: 205 }, (_, i) =>
+    event("exposure", String(8000 + i), 1000 + i),
+  );
+  exposures[0].post!.text = "Exposure-only private content ".repeat(10);
+  exposures[1].post!.text = "Shared liked content ".repeat(10);
+  const liked = {
+    ...exposures[1],
+    id: crypto.randomUUID(),
+    kind: "like" as const,
+  };
+  const own = event("exposure", "9000", 2000, "reader");
+  await saveEvents([...exposures, liked, own]);
+  const before = await activitySummary();
+  const originalRevision = await revision();
+  const keys = await Promise.all(
+    exposures.map((e) => snapshotKey(e.post!.text)),
+  );
+  const db = await database();
+  const tx = db.transaction(["events", "posts", "texts"], "readwrite");
+  const finished = new Promise<void>((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onabort = () => reject(tx.error);
+  });
+  exposures.forEach((e, i) => {
+    tx.objectStore("events").put(storeSnapshot(tx, e, keys[i]));
+    if (i !== 1)
+      tx.objectStore("posts").put({
+        ...e.post,
+        key: `reader:${e.post!.id}`,
+        at: e.at,
+        liked: false,
+        tokens: ["private"],
+        likedTokens: [],
+        embedding: new Float32Array([1]),
+      });
+  });
+  await finished;
+  await removeExposureContent(1);
+  await removeExposureContent(1);
+  await removeExposureContent(1);
+  assert.deepEqual(await activitySummary(), before);
+  assert.equal(await revision(), originalRevision);
+  const storedEvents = await activityStoreRows("events");
+  for (const e of storedEvents.filter(
+    (e) => e.kind === "exposure" && e.post.author !== "reader",
+  )) {
+    assert.equal(e.post.text, "");
+    assert.equal(e.textKey, undefined);
+  }
+  const texts = await activityStoreRows("texts");
+  assert.equal(texts.length, 1);
+  assert.equal(texts[0].text, liked.post!.text);
+  const posts = await activityStoreRows("posts");
+  for (const p of posts.filter((p) => !p.liked && p.author !== "reader")) {
+    assert.equal(p.text, "");
+    assert.deepEqual(p.tokens, []);
+    assert.equal(p.embedding, undefined);
+  }
+  assert.equal(
+    posts.find((p) => p.id === liked.post!.id).likedText,
+    liked.post!.text,
+  );
+  assert.equal(posts.find((p) => p.id === own.post!.id).text, own.post!.text);
+});
+
+test("exposure and like rankings exclude own posts per viewing identity and preserve raw records", async () => {
+  const { createSummary, matchesRecord } = await import(
+    "../src/activity/analytics"
+  );
+  const filter = { from: 0, to: 1000, viewer: "", surface: "all" as const };
+  const own = event("exposure", "101", 200, "READER");
+  const otherView = {
+    ...own,
+    id: crypto.randomUUID(),
+    post: { ...own.post!, viewer: "another" },
+  };
+  const ownLike = { ...own, id: crypto.randomUUID(), kind: "like" as const };
+  const otherLike = {
+    ...otherView,
+    id: crypto.randomUUID(),
+    kind: "like" as const,
+  };
+  const unknown = {
+    ...own,
+    id: crypto.randomUUID(),
+    post: { ...own.post!, viewer: "unknown" },
+  };
+  const summary = createSummary(filter);
+  [own, otherView, ownLike, otherLike, unknown].forEach(summary.add);
+  const result = summary.result();
+  assert.equal(result.exposures, 2);
+  assert.equal(result.uniqueSeen, 2);
+  assert.equal(result.accounts[0].exposures, 2);
+  assert.equal(result.likedPosts, 1);
+  assert.equal(result.likeActions, 1);
+  assert.equal(result.accounts[0].likedPosts, 1);
+  assert.equal(result.days[0].likeActions, 1);
+  assert.equal(result.days[0].exposures, 2);
+  const records = {
+    ...filter,
+    kind: "exposure" as const,
+    author: "",
+    query: "",
+    day: "",
+    domain: "",
+  };
+  assert.equal(matchesRecord(own, records), false);
+  assert.equal(matchesRecord(otherView, records), true);
+  assert.equal(matchesRecord(own, { ...records, kind: "all" }), true);
+  assert.equal(matchesRecord(ownLike, { ...records, kind: "like" }), false);
+  assert.equal(matchesRecord(otherLike, { ...records, kind: "like" }), true);
+  assert.equal(matchesRecord(ownLike, { ...records, kind: "all" }), true);
+  const viewerSummary = createSummary({ ...filter, viewer: "reader" });
+  [own, otherView, ownLike, otherLike, unknown].forEach(viewerSummary.add);
+  assert.equal(viewerSummary.result().exposures, 0);
+  assert.equal(viewerSummary.result().likedPosts, 0);
 });

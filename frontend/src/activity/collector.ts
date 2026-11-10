@@ -4,6 +4,7 @@ import {
   getActivitySettings,
   isTrackingEnabled,
   cleanUrl,
+  stripExposureContent,
   type ActivityEvent,
   type PostSnapshot,
 } from "./model";
@@ -82,20 +83,22 @@ export function startActivityCollection(): void {
       reportedOverflow = true;
       return;
     }
-    pending.push({
-      id: crypto.randomUUID(),
-      kind,
-      post,
-      at: Date.now(),
-      url: cleanUrl(location.href)!,
-      session: eventSession,
-      context:
-        location.pathname === "/home"
-          ? "home-feed"
-          : location.pathname.includes("/status/")
-            ? "thread"
-            : "other",
-    });
+    pending.push(
+      stripExposureContent({
+        id: crypto.randomUUID(),
+        kind,
+        post,
+        at: Date.now(),
+        url: cleanUrl(location.href)!,
+        session: eventSession,
+        context:
+          location.pathname === "/home"
+            ? "home-feed"
+            : location.pathname.includes("/status/")
+              ? "thread"
+              : "other",
+      }),
+    );
     if (kind === "like" || kind === "unlike" || pending.length >= 25)
       void flush();
     else if (!timer)

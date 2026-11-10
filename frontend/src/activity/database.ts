@@ -1,6 +1,7 @@
 import { snapshotKey, storeSnapshot, restoreSnapshot } from "./snapshots";
 import {
   NEWS_CATALOG_KEY,
+  stripExposureContent,
   tokens,
   evidenceReady,
   isOwnPost,
@@ -161,6 +162,7 @@ function removePreferenceEvents(
 }
 
 export async function saveEvents(events: ActivityEvent[]): Promise<void> {
+  events = events.map(stripExposureContent);
   // Unlike is a deletion command, not an event to persist or embed.
   const keys = await Promise.all(
     events.map((event) =>
@@ -264,6 +266,12 @@ export async function saveEvents(events: ActivityEvent[]): Promise<void> {
               tokens: tokens(latest.text),
               likedTokens: liked ? tokens(likedText ?? post.text) : [],
             };
+            if (!isOwnPost(row)) {
+              row.text = liked
+                ? (likedText ?? old?.likedText ?? old?.text ?? post.text)
+                : "";
+              row.tokens = tokens(row.text);
+            }
             row.preferenceAt = preferenceAt(row);
             row.embedding =
               isPreferencePost(row) &&

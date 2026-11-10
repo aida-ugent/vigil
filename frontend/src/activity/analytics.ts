@@ -1,6 +1,6 @@
 import { readNewsState, newsMatcher } from "./news";
 import { restoreSnapshot } from "./snapshots";
-import type { ActivityEvent } from "./model";
+import { isOwnPost, type ActivityEvent } from "./model";
 import { database } from "./database";
 
 export interface DashboardFilter {
@@ -91,6 +91,7 @@ export function createSummary(filter: DashboardFilter) {
     if (event.post) viewers.add(event.post.viewer);
     if (!matchesX(event, filter)) return;
     const post = event.post!;
+    if (isOwnPost(post)) return;
     const account = accounts.get(post.author) ?? {
       author: post.author,
       exposures: 0,
@@ -203,6 +204,11 @@ export function matchesRecord(
     }
   } else {
     if (filter.domain || !matchesX(event, filter)) return false;
+    if (
+      (filter.kind === "exposure" || filter.kind === "like") &&
+      isOwnPost(event.post!)
+    )
+      return false;
     if (
       filter.author &&
       event.post!.author !== filter.author.replace(/^@/, "").toLowerCase()

@@ -36,3 +36,6 @@ frontend/public/models/
 # Personal activity / diagnostic exports
 vigil-cb-diagnostics-*.json
 vigil-activity-*.jsonl
+
+# Generated Media Cloud directory snapshot
+backend/.cache/

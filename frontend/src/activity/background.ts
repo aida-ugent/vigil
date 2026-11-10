@@ -14,6 +14,7 @@ import {
 } from "./model";
 import { saveEvents, clearActivity } from "./database";
 
+const VISIT_TAB_PREFIX = "vigilNewsVisitTab:";
 let queue: Promise<unknown> = Promise.resolve();
 function enqueue<T>(work: () => Promise<T>): Promise<T> {
   const next = queue.then(work, work);
@@ -24,21 +25,6 @@ function enqueue<T>(work: () => Promise<T>): Promise<T> {
 chrome.runtime.onMessage.addListener(
   (message: unknown, sender, sendResponse) => {
     if (!isRuntimeRequestMessage(message)) return;
-    if (message.type === "NEWS_CATALOG_REFRESH") {
-      if (
-        sender.id !== chrome.runtime.id ||
-        sender.tab?.incognito ||
-        !sender.url?.startsWith(chrome.runtime.getURL(""))
-      )
-        return;
-      void refreshNews(message.payload.force).then(
-        () =>
-          sendResponse({ type: "NEWS_CATALOG_RESULT", payload: { ok: true } }),
-        () =>
-          sendResponse({ type: "NEWS_CATALOG_RESULT", payload: { ok: false } }),
-      );
-      return true;
-    }
     const respond = (
       payload: RuntimeResponseMap["ACTIVITY_BATCH"]["payload"],
     ): void => {
@@ -61,6 +47,10 @@ chrome.runtime.onMessage.addListener(
         if (sender.tab || !sender.url?.startsWith(chrome.runtime.getURL("")))
           throw new Error("Extension page required");
         await clearActivity();
+        const session = await chrome.storage.session.get(null);
+        await chrome.storage.session.remove(
+          Object.keys(session).filter((key) => key.startsWith(VISIT_TAB_PREFIX)),
+        );
         return { ok: true };
       }
       if (sender.frameId !== 0 || !sender.tab || !sender.url)
@@ -94,15 +84,24 @@ export async function recordNewsVisit(
   id: string,
 ): Promise<void> {
   const normalized = cleanUrl(url);
-  if (!normalized) return;
   await enqueue(async () => {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.incognito || tab.url !== url) return;
+    const key = `${VISIT_TAB_PREFIX}${tabId}`;
     if (
+      !normalized ||
       !(await getActivitySettings()).tracking ||
       !(await newsCatalog.matches(normalized))
-    )
+    ) {
+      // Leaving a news page permits a later return to count again. Do not
+      // retain URLs for non-news pages or activity while tracking is paused.
+      await chrome.storage.session.remove(key);
       return;
-    const tab = await chrome.tabs.get(tabId);
-    if (tab.incognito || cleanUrl(tab.url ?? "") !== normalized) return;
+    }
+    // Session storage survives worker suspension and reloads, but not browser
+    // restarts. cleanUrl strips queries/fragments that sites churn via history.
+    const previous = await chrome.storage.session.get(key);
+    if (previous[key] === normalized) return;
     const event: ActivityEvent = {
       id: crypto.randomUUID(),
       kind: "visit",
@@ -112,8 +111,13 @@ export async function recordNewsVisit(
       session: id.slice(0, 100),
     };
     await saveEvents([event]);
+    await chrome.storage.session.set({ [key]: normalized });
   });
 }
+chrome.tabs.onRemoved.addListener((tabId) => {
+  void enqueue(() => chrome.storage.session.remove(`${VISIT_TAB_PREFIX}${tabId}`))
+    .catch((error) => console.warn("[Vigil activity] Failed to clear tab state", error));
+});
 chrome.webNavigation.onCommitted.addListener((details) => {
   if (details.frameId === 0)
     void recordNewsVisit(
@@ -183,16 +187,12 @@ void chrome.alarms
     console.warn("[Vigil activity] Maintenance could not be scheduled", error),
   );
 
-async function refreshNews(force = false): Promise<void> {
-  const state = await newsCatalog.refresh(force);
+async function refreshNews(): Promise<void> {
+  const state = await newsCatalog.refresh();
   if (state.catalog) await pruneNonNewsVisits(state.catalog);
 }
-chrome.runtime.onInstalled.addListener(() => {
-  void refreshNews(true).catch((error) =>
-    console.warn("[Vigil news] Could not refresh news list", error),
-  );
-});
-chrome.runtime.onStartup.addListener(() => {
+chrome.runtime.onInstalled.addListener((details) => {
+  if (details.reason !== "install" && details.reason !== "update") return;
   void refreshNews().catch((error) =>
     console.warn("[Vigil news] Could not refresh news list", error),
   );

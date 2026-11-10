@@ -37,7 +37,7 @@ function load(): Promise<FeatureExtractionPipeline> {
   })().catch((error) => {
     extractor = null;
     throw new Error(
-      `Embedding model unavailable. Run "npm run assets:model" to vendor the weights. (${error instanceof Error ? error.message : "unknown error"})`,
+      `Embedding runtime or model unavailable. Rebuild with "npm run build" and reload the extension. (${error instanceof Error ? error.message : "unknown error"})`,
     );
   }));
 }

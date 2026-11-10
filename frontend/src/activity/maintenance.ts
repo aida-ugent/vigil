@@ -1,3 +1,9 @@
+import {
+  isOwnPost,
+  tokens,
+  stripExposureContent,
+  type StoredPost,
+} from "./model";
 import { newsMatcher, type NewsCatalog } from "./news";
 import { database, saveEvents } from "./database";
 import { snapshotKey, storeSnapshot, type StoredEvent } from "./snapshots";
@@ -126,6 +132,7 @@ export function maintainActivity(): Promise<void> {
   return (running ??= (async () => {
     await pruneVisits();
     await removeUnlikeHistory();
+    await removeExposureContent();
     await compactSnapshots();
   })().finally(() => {
     running = undefined;
@@ -178,4 +185,78 @@ export async function pruneNonNewsVisits(catalog: NewsCatalog): Promise<void> {
   const tx = db.transaction("meta", "readwrite");
   tx.objectStore("meta").put(catalog.version, "newsVisitsVersion");
   await complete(tx);
+}
+
+/** Remove legacy exposure content in resumable, short transactions. */
+export async function removeExposureContent(maxBatches = 100): Promise<void> {
+  const db = await database();
+  for (const store of ["events", "posts"] as const) {
+    const marker = `exposureContentCleanup:${store}`;
+    for (let batch = 0; batch < maxBatches; batch++) {
+      const progress = await read(
+        db.transaction("meta").objectStore("meta").get(marker),
+      );
+      if (progress?.done) break;
+      const tx = db.transaction(
+        ["events", "posts", "texts", "meta"],
+        "readwrite",
+      );
+      const finished = complete(tx);
+      let count = 0;
+      const req = tx
+        .objectStore(store)
+        .openCursor(
+          progress?.after
+            ? IDBKeyRange.lowerBound(progress.after, true)
+            : undefined,
+        );
+      req.onsuccess = () => {
+        const cursor = req.result;
+        if (!cursor) {
+          tx.objectStore("meta").put({ done: true }, marker);
+          return;
+        }
+        if (store === "events") {
+          const event = cursor.value as StoredEvent;
+          if (
+            event.kind === "exposure" &&
+            event.post &&
+            !isOwnPost(event.post)
+          ) {
+            const { textKey, ...original } = event;
+            cursor.update(stripExposureContent(original));
+            if (textKey) {
+              // The index reflects the update above; retain text still used by a like/own post.
+              const refs = tx
+                .objectStore("events")
+                .index("textKey")
+                .count(textKey);
+              refs.onsuccess = () => {
+                if (!refs.result) tx.objectStore("texts").delete(textKey);
+              };
+            }
+          }
+        } else {
+          const post = cursor.value as StoredPost;
+          if (!isOwnPost(post)) {
+            const text = post.liked ? (post.likedText ?? post.text) : "";
+            cursor.update({
+              ...post,
+              text,
+              tokens: tokens(text),
+              likedText: post.liked ? text : undefined,
+              likedTokens: post.liked ? tokens(text) : [],
+              embedding: post.liked ? post.embedding : undefined,
+              embeddingVersion: post.liked ? post.embeddingVersion : undefined,
+              preferenceAt: post.liked ? post.preferenceAt : undefined,
+            });
+          }
+        }
+        tx.objectStore("meta").put({ after: cursor.primaryKey }, marker);
+        if (++count < BATCH) cursor.continue();
+      };
+      await finished;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+  }
 }

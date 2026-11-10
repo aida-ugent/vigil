@@ -1,16 +1,16 @@
 import { getDomain } from "tldts";
+import { getSettings } from "../shared/settingsStorage";
 import { database } from "./database";
 import { NEWS_CATALOG_KEY } from "./model";
 
-const LATEST =
-  "https://api.github.com/repos/yang3kc/list_of_news_domains/commits?path=data/output/news_domains.csv&per_page=1";
-const MAX_BYTES = 2_000_000;
-const MAX_AGE = 30 * 24 * 60 * 60 * 1000;
-const RETRY_AFTER = 6 * 60 * 60 * 1000;
+const MAX_BYTES = 8_000_000;
 export interface NewsCatalog {
   domains: string[];
   fetchedAt: number;
   version: string;
+  source?: "mediacloud";
+  scope?: "geographic-publishers-v1";
+  publishedAt?: string;
 }
 export interface NewsCatalogState {
   catalog?: NewsCatalog;
@@ -30,6 +30,8 @@ export async function readNewsState(): Promise<NewsCatalogState> {
 async function writeNewsState(state: NewsCatalogState): Promise<void> {
   const tx = (await database()).transaction("meta", "readwrite");
   tx.objectStore("meta").put(state, NEWS_CATALOG_KEY);
+  tx.objectStore("meta").delete("newsCatalogV1");
+  tx.objectStore("meta").delete("mediaCloudCatalogV1");
   await new Promise<void>((resolve, reject) => {
     tx.oncomplete = () => resolve();
     tx.onabort = tx.onerror = () => reject(tx.error);
@@ -54,25 +56,41 @@ function domain(value: string): string | null {
     return null;
   }
 }
-export function parseNewsDomains(csv: string): string[] {
-  if (new TextEncoder().encode(csv).byteLength > MAX_BYTES)
+export function parseNewsCatalog(text: string): NewsCatalog {
+  if (new TextEncoder().encode(text).byteLength > MAX_BYTES)
     throw new Error("News list too large");
-  const lines = csv
-    .replace(/^\uFEFF/, "")
-    .trim()
-    .split(/\r?\n/);
-  if (lines.shift()?.trim() !== "domain" || lines.length > 100_000)
-    throw new Error("Invalid news list");
+  const data = JSON.parse(text);
+  if (
+    data?.source !== "mediacloud" ||
+    data.scope !== "geographic-publishers-v1" ||
+    typeof data.publishedAt !== "string" ||
+    !/^\d{4}-\d{2}-\d{2}$/.test(data.publishedAt) ||
+    typeof data.version !== "string" ||
+    !/^mediacloud-curated:[a-f0-9]{64}$/.test(data.version) ||
+    !Number.isFinite(data.fetchedAt) ||
+    data.fetchedAt <= 0 ||
+    !Array.isArray(data.domains) ||
+    data.domains.length < 100 ||
+    data.domains.length > 200_000
+  )
+    throw new Error("Invalid Media Cloud snapshot");
   const domains = new Set<string>();
-  let invalid = 0;
-  for (const line of lines) {
-    const normalized = domain(line.trim().replace(/^"([^"]+)"$/, "$1"));
+  for (const value of data.domains) {
+    if (typeof value !== "string") throw new Error("Invalid news domain");
+    const normalized = domain(value);
+    // Public suffixes and shared-hosting roots must never become allowlist entries.
     if (normalized) domains.add(normalized);
-    else invalid++;
   }
-  if (domains.size < 100 || invalid > lines.length / 10)
+  if (domains.size < 100 || domains.size < data.domains.length * 0.9)
     throw new Error("Incomplete news list");
-  return [...domains].sort();
+  return {
+    source: "mediacloud",
+    scope: "geographic-publishers-v1",
+    publishedAt: data.publishedAt,
+    domains: [...domains].sort(),
+    fetchedAt: data.fetchedAt,
+    version: data.version,
+  };
 }
 export function newsMatcher(catalog?: NewsCatalog): (url: string) => boolean {
   const domains = new Set(catalog?.domains ?? []);
@@ -135,26 +153,24 @@ export class NewsCatalogService {
       write: writeNewsState,
       fetch: globalThis.fetch.bind(globalThis),
       now: Date.now,
+      endpoint: async () => {
+        const { serverUrl } = await getSettings();
+        return `${serverUrl.replace(/\/+$/, "")}/news/sources`;
+      },
     },
   ) {}
   async matches(url: string): Promise<boolean> {
     const state = await (this.cached ??= this.io.read());
     return (this.matcher ??= newsMatcher(state.catalog))(url);
   }
-  refresh(force = false): Promise<NewsCatalogState> {
-    return (this.running ??= this.update(force).finally(() => {
+  refresh(): Promise<NewsCatalogState> {
+    return (this.running ??= this.update().finally(() => {
       this.running = undefined;
     }));
   }
-  private async update(force: boolean): Promise<NewsCatalogState> {
+  private async update(): Promise<NewsCatalogState> {
     let state = await this.io.read();
     const now = this.io.now();
-    if (
-      (!force && state.catalog && now - state.catalog.fetchedAt < MAX_AGE) ||
-      (state.attemptedAt !== undefined &&
-        now - state.attemptedAt < (force ? 60_000 : RETRY_AFTER))
-    )
-      return state;
     state = { ...state, attemptedAt: now };
     await this.io.write(state);
     try {
@@ -163,35 +179,23 @@ export class NewsCatalogService {
         referrerPolicy: "no-referrer",
         signal: AbortSignal.timeout(15_000),
       };
-      const metadata = JSON.parse(
-        await boundedText(await this.io.fetch(LATEST, options), 100_000),
+      const catalog = parseNewsCatalog(
+        await boundedText(
+          await this.io.fetch(await this.io.endpoint(), options),
+          MAX_BYTES,
+        ),
       );
-      const version = Array.isArray(metadata) ? metadata[0]?.sha : undefined;
-      if (typeof version !== "string" || !/^[a-f0-9]{40}$/.test(version))
-        throw new Error("Invalid news metadata");
-      const domains =
-        state.catalog?.version === version
-          ? state.catalog.domains
-          : parseNewsDomains(
-              await boundedText(
-                await this.io.fetch(
-                  `https://raw.githubusercontent.com/yang3kc/list_of_news_domains/${version}/data/output/news_domains.csv`,
-                  options,
-                ),
-                MAX_BYTES,
-              ),
-            );
-      if (state.catalog && domains.length < state.catalog.domains.length / 2)
+      if (
+        state.catalog &&
+        catalog.domains.length < state.catalog.domains.length / 2
+      )
         throw new Error("Unexpectedly incomplete news list");
-      state = {
-        attemptedAt: now,
-        catalog: { domains, fetchedAt: now, version },
-      };
+      state = { attemptedAt: now, catalog };
     } catch {
       state = {
         ...state,
         error:
-          "News list update failed. The last saved list is still used, if available.",
+          "Media Cloud download failed. The last saved Media Cloud list is still used, if available.",
       };
     }
     await this.io.write(state);

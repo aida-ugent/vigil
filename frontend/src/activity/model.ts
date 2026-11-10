@@ -1,7 +1,7 @@
 import { eng } from "stopword";
 import { z } from "zod";
 
-export const NEWS_CATALOG_KEY = "newsCatalogV1";
+export const NEWS_CATALOG_KEY = "mediaCloudCuratedCatalogV1";
 export const ACTIVITY_SETTINGS_KEY = "vigilActivitySettingsV1";
 export interface ActivitySettings {
   tracking: boolean;
@@ -124,6 +124,14 @@ export function isOwnPost(post: PostSnapshot): boolean {
     post.author.toLowerCase() === post.viewer.toLowerCase()
   );
 }
+/** Exposure statistics never need another account's post content. */
+export function stripExposureContent(event: ActivityEvent): ActivityEvent {
+  if (event.kind !== "exposure" || !event.post || isOwnPost(event.post))
+    return event;
+  const { title: _title, ...metadata } = event;
+  return { ...metadata, post: { ...event.post, text: "" } };
+}
+
 export function isPreferencePost(post: StoredPost): boolean {
   return post.liked || isOwnPost(post);
 }

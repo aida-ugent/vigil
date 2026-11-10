@@ -1,5 +1,4 @@
 import { readNewsState } from "./news";
-import { sendRuntimeMessage } from "../shared/messages";
 import "./browser.css";
 import type {
   DashboardFilter,
@@ -194,7 +193,10 @@ function appendRow(event: ActivityEvent) {
       /* Legacy data. */
     }
   }
-  const content = event.post?.text ?? event.title ?? event.url;
+  const content =
+    event.kind === "exposure" && event.post && !event.post.text
+      ? "Post content not stored"
+      : (event.post?.text ?? event.title ?? event.url);
   for (const text of [
     new Date(event.at).toLocaleString(),
     labels[event.kind],
@@ -286,6 +288,7 @@ async function loadRecords(reset: boolean) {
   }
 }
 async function refresh() {
+  void showNewsList();
   el("custom-dates").hidden = value("period") !== "custom";
   let newFilter: DashboardFilter;
   try {
@@ -382,32 +385,14 @@ el("more").addEventListener("click", () => void loadRecords(false));
 window.addEventListener("pagehide", () => client.dispose());
 void refresh();
 
-async function updateNewsList(force = false): Promise<void> {
-  const button = el<HTMLButtonElement>("refresh-news-list");
-  button.disabled = true;
+async function showNewsList(): Promise<void> {
   const status = el("news-catalog-status");
   try {
-    const existing = await readNewsState();
-    status.textContent = existing.catalog
-      ? `${existing.catalog.domains.length.toLocaleString()} news domains cached. Checking for updates…`
-      : "Loading the news-site list. X tracking remains available.";
-    await sendRuntimeMessage({
-      type: "NEWS_CATALOG_REFRESH",
-      payload: { force },
-    });
     const state = await readNewsState();
     status.textContent = state.catalog
-      ? `${state.catalog.domains.length.toLocaleString()} domains · updated ${new Date(state.catalog.fetchedAt).toLocaleDateString()}.${state.error ? " Update unavailable; using the saved list." : ""}`
-      : "News-site list unavailable. News visits are not saved until a list is downloaded; X tracking is unaffected.";
-    await refresh();
+      ? `${state.catalog.domains.length.toLocaleString()} curated news domains · source edition ${state.catalog.publishedAt ?? "unknown"} · downloaded ${new Date(state.catalog.fetchedAt).toLocaleDateString()}.${state.error ? " Download failed; using the saved list." : ""}`
+      : "Media Cloud list unavailable. News visits are not saved; X tracking is unaffected. Prepare the backend snapshot, then reload or update Vigil.";
   } catch {
-    status.textContent =
-      "Could not refresh the news-site list. Any saved list remains in use.";
-  } finally {
-    button.disabled = false;
+    status.textContent = "Could not read the saved Media Cloud list.";
   }
 }
-el("refresh-news-list").addEventListener("click", () => {
-  void updateNewsList(true);
-});
-void updateNewsList();

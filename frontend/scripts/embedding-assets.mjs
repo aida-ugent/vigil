@@ -65,8 +65,28 @@ if (!["all", "model", "ort", "check"].includes(mode))
   throw new Error("Unknown asset mode: " + mode);
 if (mode !== "model") {
   await mkdir(join(root, "public/ort"), { recursive: true });
-  for (const suffix of [".mjs", ".wasm", ".jsep.mjs", ".jsep.wasm"]) {
-    const name = "ort-wasm-simd-threaded" + suffix;
+  // Runtime variants change across ONNX upgrades (e.g. Transformers v4 uses
+  // asyncify). Vendor every exported WASM loader/binary pair from the installed
+  // package instead of maintaining a list that can silently omit a new backend.
+  const runtime = JSON.parse(
+    await readFile(
+      join(root, "node_modules/onnxruntime-web/package.json"),
+      "utf8",
+    ),
+  );
+  const names = Object.keys(runtime.exports)
+    .filter((name) => /^\.\/ort-wasm-[a-z0-9.-]+\.(mjs|wasm)$/.test(name))
+    .map((name) => name.slice(2));
+  if (!names.length)
+    throw new Error("No exported ONNX WASM runtime assets found");
+  for (const name of names) {
+    const counterpart = name.replace(
+      /\.(mjs|wasm)$/,
+      name.endsWith(".mjs") ? ".wasm" : ".mjs",
+    );
+    if (!names.includes(counterpart))
+      throw new Error("Incomplete ONNX runtime pair: " + name);
+
     const source = join(root, "node_modules/onnxruntime-web/dist", name);
     const target = join(root, "public/ort", name);
     if (mode === "check") {
