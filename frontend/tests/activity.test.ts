@@ -967,14 +967,46 @@ test("CB badge is separate from phrase highlights, supports hover/focus/click, a
     const host = document.querySelector<HTMLElement>(
       "[data-vigil-confirmation-badge]",
     )!;
+    assert.equal(host.nextElementSibling, article.querySelector('[data-testid="tweetText"]'));
+    assert.equal(host.style.position, "relative");
+    assert.equal(host.style.top, "");
+    assert.equal(host.style.right, "");
+    const header = document.createElement("div");
+    header.style.display = "flex";
+    header.innerHTML = '<div data-testid="User-Name">Alice</div><div data-action="grok"><button aria-label="Grok actions">Grok</button></div><div><button data-testid="caret">More</button></div>';
+    article.prepend(header);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const more = header.querySelector('[data-testid="caret"]')!;
+    assert.equal(host.parentElement, more.parentElement);
+    assert.equal(host.nextElementSibling, more);
+    const follow = document.createElement("div");
+    follow.innerHTML = '<button data-testid="123-follow">Follow</button>';
+    header.insertBefore(follow, header.querySelector('[data-action="grok"]'));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(host.nextElementSibling, more);
+    assert.equal(host.style.alignSelf, "center");
+    // Match the supplied X markup: an outer space-between header, then a
+    // nested actions row and several wrappers around the More icon.
+    const controls = document.createElement("div");
+    controls.innerHTML = '<div style="display:flex;justify-content:space-between"><div data-slot="follow"></div><div data-slot="grok"></div><div><div><div data-slot="more" style="display:flex;flex-direction:row"></div></div></div></div>';
+    header.append(controls);
+    controls.querySelector('[data-slot="follow"]')!.append(follow);
+    controls.querySelector('[data-slot="grok"]')!.append(header.querySelector('[data-action="grok"]')!);
+    controls.querySelector('[data-slot="more"]')!.append(more);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(host.parentElement, controls.querySelector('[data-slot="more"]'));
+    assert.equal(host.nextElementSibling, more);
     const root = host.shadowRoot!;
     const button = root.querySelector("button")!;
     const tooltip = root.querySelector<HTMLElement>('[role="tooltip"]')!;
     assert.equal(button.textContent, "CB?");
     assert.equal(tooltip.hidden, true);
-    host.dispatchEvent(new dom.window.Event("pointerenter"));
+    host.dispatchEvent(new dom.window.MouseEvent("pointerenter", { clientX: 400, clientY: 200 }));
     assert.equal(tooltip.hidden, false);
-    assert.match(tooltip.textContent!, /not a fact-check/);
+    assert.equal(tooltip.getAttribute("popover"), "manual");
+    assert.equal(tooltip.style.left, "400px");
+    assert.equal(tooltip.style.top, "208px");
+    assert.match(tooltip.textContent!, /Possible confirmation-bias risk/);
     assert.equal(root.querySelector("img"), null);
     host.dispatchEvent(new dom.window.Event("pointerleave"));
     assert.equal(tooltip.hidden, true);
