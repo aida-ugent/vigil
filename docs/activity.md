@@ -45,6 +45,10 @@ a fact-check nor a judgment about the reader.
 On X, qualifying posts receive an amber **CB?** badge. Hover, focus, or click to
 read its explanation. CB findings do not trigger automatic rewrites or hiding.
 Personalized results are not stored in the ordinary analysis cache.
+The badge uses a closed shadow root, and its personalized explanation is inserted
+only while the tooltip is open. This blocks ordinary page scripts from reading
+it through `element.shadowRoot`; it is not full isolation from the host page.
+The page can still observe the badge's presence and modify or remove its host.
 
 ![Example of the confirmation-bias badge and explanation on X](assets/readme/confirmation-bias-example.png)
 

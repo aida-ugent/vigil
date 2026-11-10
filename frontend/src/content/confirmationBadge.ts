@@ -49,6 +49,7 @@ function placeBadge(host: HTMLElement, article: HTMLElement): void {
   if (host.nextElementSibling !== target) target.before(host);
 }
 function remove(badge: Badge): void {
+  badge.hide();
   badge.host.remove();
   badges.delete(badge.article);
 }
@@ -88,7 +89,10 @@ export function addConfirmationBadge(article: HTMLElement, postId: string, text:
   host.setAttribute("data-vigil-confirmation-badge", "");
   // Participate in layout so the badge cannot cover native header controls.
   host.style.cssText = "display:block;position:relative;align-self:flex-start;flex:none;width:max-content;max-width:100%;margin:4px 0;line-height:normal;";
-  const root = host.attachShadow({ mode: "open" });
+  // Keep personalized text out of the page's ordinary DOM traversal. Retain
+  // the root only in this content-script closure; never expose it on the host.
+  // This reduces DOM disclosure, but does not isolate UI from the host page.
+  const root = host.attachShadow({ mode: "closed" });
   const style = document.createElement("style");
   style.textContent = `
     :host { font: 13px/1.4 system-ui, sans-serif; }
@@ -112,16 +116,19 @@ export function addConfirmationBadge(article: HTMLElement, postId: string, text:
   tooltip.setAttribute("popover", "manual");
   tooltip.id = "cb-explanation"; tooltip.setAttribute("role", "tooltip"); tooltip.hidden = true;
   const meaning = document.createElement("strong"); meaning.textContent = CONFIRMATION_BADGE_MEANING;
-  const explanation = document.createElement("p"); explanation.textContent = findings[0].explanation;
+  const explanationText = findings[0].explanation;
+  const explanation = document.createElement("p");
   tooltip.append(meaning, explanation); root.append(style, button, tooltip);
   let pinned = false;
   const hide = () => {
     pinned = false;
     tooltip.hidePopover?.();
     tooltip.hidden = true;
+    explanation.textContent = "";
     button.setAttribute("aria-expanded", "false");
   };
   const show = (event?: Event) => {
+    explanation.textContent = explanationText;
     tooltip.hidden = false;
     tooltip.showPopover?.();
     button.setAttribute("aria-expanded", "true");

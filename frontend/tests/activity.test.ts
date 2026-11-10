@@ -961,6 +961,15 @@ test("CB badge is separate from phrase highlights, supports hover/focus/click, a
       },
     ],
   };
+  // Test-only access to internals. Production retains the closed root solely
+  // in its content-script closure and exposes no DOM property or test hook.
+  const roots = new WeakMap<Element, ShadowRoot>();
+  const attachShadow = dom.window.Element.prototype.attachShadow;
+  dom.window.Element.prototype.attachShadow = function (options: ShadowRootInit) {
+    const root = attachShadow.call(this, options);
+    roots.set(this, root);
+    return root;
+  };
   try {
     assert.equal(highlightTweetFindings([result]).totalHighlights, 2);
     assert.equal(document.querySelectorAll("mark").length, 1);
@@ -996,11 +1005,16 @@ test("CB badge is separate from phrase highlights, supports hover/focus/click, a
     await new Promise((resolve) => setTimeout(resolve, 0));
     assert.equal(host.parentElement, controls.querySelector('[data-slot="more"]'));
     assert.equal(host.nextElementSibling, more);
-    const root = host.shadowRoot!;
+    assert.equal(host.shadowRoot, null);
+    assert.equal(host.textContent, "");
+    assert.ok(!article.outerHTML.includes(result.findings[1].explanation));
+    const root = roots.get(host)!;
+    assert.equal(root.mode, "closed");
     const button = root.querySelector("button")!;
     const tooltip = root.querySelector<HTMLElement>('[role="tooltip"]')!;
     assert.equal(button.textContent, "CB?");
     assert.equal(tooltip.hidden, true);
+    assert.equal(tooltip.querySelector("p")!.textContent, "");
     host.dispatchEvent(new dom.window.MouseEvent("pointerenter", { clientX: 400, clientY: 200 }));
     assert.equal(tooltip.hidden, false);
     assert.equal(tooltip.getAttribute("popover"), "manual");
@@ -1008,8 +1022,12 @@ test("CB badge is separate from phrase highlights, supports hover/focus/click, a
     assert.equal(tooltip.style.top, "208px");
     assert.match(tooltip.textContent!, /Possible confirmation-bias risk/);
     assert.equal(root.querySelector("img"), null);
+    assert.equal(tooltip.querySelector("p")!.textContent, result.findings[1].explanation);
+    assert.equal(host.shadowRoot, null);
+    assert.ok(!document.body.innerHTML.includes("No universal savings evidence shown."));
     host.dispatchEvent(new dom.window.Event("pointerleave"));
     assert.equal(tooltip.hidden, true);
+    assert.equal(tooltip.querySelector("p")!.textContent, "");
     button.focus();
     assert.equal(tooltip.hidden, false);
     button.dispatchEvent(
@@ -1019,6 +1037,13 @@ test("CB badge is separate from phrase highlights, supports hover/focus/click, a
     button.click();
     assert.equal(tooltip.hidden, false);
     assert.equal(navigated, false);
+    // Events from inside a closed root still include its host for outside-click handling.
+    tooltip.dispatchEvent(new dom.window.MouseEvent("pointerdown", { bubbles: true, composed: true }));
+    assert.equal(tooltip.hidden, false);
+    document.body.dispatchEvent(new dom.window.MouseEvent("pointerdown", { bubbles: true, composed: true }));
+    assert.equal(tooltip.hidden, true);
+    assert.equal(tooltip.querySelector("p")!.textContent, "");
+    button.click();
     button.click();
     assert.equal(tooltip.hidden, true);
     highlightTweetFindings([result]);
@@ -1042,6 +1067,7 @@ test("CB badge is separate from phrase highlights, supports hover/focus/click, a
     assert.equal(document.querySelector("mark"), null);
   } finally {
     clearAllHighlights();
+    dom.window.Element.prototype.attachShadow = attachShadow;
     dom.window.close();
   }
 });
