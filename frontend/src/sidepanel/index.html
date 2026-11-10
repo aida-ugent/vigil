@@ -21,6 +21,36 @@
           Ready to analyze.
         </p>
 
+        <section class="settings-group-box" aria-label="Activity tracking">
+          <div class="tracking-controls">
+            <label class="field field--inline">
+              <input id="track-interactions" type="checkbox" role="switch" aria-describedby="tracking-description" />
+              <span>Track interactions</span>
+            </label>
+            <button class="info-icon tracking-info" type="button" aria-label="About interaction tracking" aria-describedby="tracking-description">
+              i
+              <span class="tracking-tooltip" id="tracking-description" role="tooltip">Store news-site visits, X exposure counts, and content from liked posts and your own posts to help detect confirmation bias and provide activity statistics.</span>
+            </button>
+            <button id="activity-browse" class="btn btn-ghost btn-xs dashboard-link" type="button" aria-label="Influence Dashboard (opens in a new tab)">Influence Dashboard <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M14 3h7v7M21 3l-11 11M10 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-5"/></svg></button>
+          </div>
+          <details class="disclosure">
+            <summary class="disclosure-trigger">Activity and confirmation bias</summary>
+            <div class="disclosure-body">
+              <p class="meta">Enable confirmation-bias detection in Settings → Plugins → Confirmation bias.</p>
+              <p class="meta">Data stays in this browser. During analysis, relevant post excerpts are sent to your selected LLM provider, including your cloud provider if configured. Pausing tracking keeps saved history.</p>
+              <p class="meta" id="activity-status" role="status">Loading activity…</p>
+              <p class="meta" id="confirmation-status" role="status"></p>
+              <button id="confirmation-diagnostics" class="btn btn-ghost btn-xs" type="button">CB diagnostics</button>
+              <div class="btn-row">
+                <button id="activity-refresh" class="btn btn-ghost btn-xs" type="button">Refresh statistics</button>
+                <button id="activity-export" class="btn btn-ghost btn-xs" type="button">Export activity</button>
+                <button id="activity-delete" class="btn btn-ghost btn-xs" type="button">Delete activity</button>
+              </div>
+              <div id="activity-accounts" class="meta"></div>
+            </div>
+          </details>
+        </section>
+
         <!-- Currently Viewing: scroll-synced card showing the primary visible content -->
         <section class="viewing-card" id="viewing-card" aria-label="Currently viewing">
           <div class="viewing-header">
@@ -122,6 +152,7 @@
             <span class="diag-label">Highlights</span>
             <span class="diag-value" id="highlight-status">—</span>
           </div>
+          <div class="disclosure-body" id="storage-diagnostics"></div>
         </details>
       </div>
 
@@ -180,6 +211,7 @@
             <label class="field">
               <span class="field-label">Backend</span>
               <select id="llm-backend" class="select">
+                <option value="none">Disabled</option>
                 <option value="local-api">Local API (Ollama)</option>
                 <option value="cloud-api">Cloud API</option>
                 <option value="webllm">Browser AI (WebLLM)</option>

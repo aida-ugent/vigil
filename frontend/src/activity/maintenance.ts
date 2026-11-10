@@ -1,0 +1,262 @@
+import {
+  isOwnPost,
+  tokens,
+  stripExposureContent,
+  type StoredPost,
+} from "./model";
+import { newsMatcher, type NewsCatalog } from "./news";
+import { database, saveEvents } from "./database";
+import { snapshotKey, storeSnapshot, type StoredEvent } from "./snapshots";
+
+const BATCH = 200;
+const COMPACTION_CURSOR = "snapshotCompactionCursor";
+const COMPACTION_DONE = "snapshotCompactionDone";
+
+function read<T>(request: IDBRequest<T>): Promise<T> {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+function complete(tx: IDBTransaction): Promise<void> {
+  return new Promise((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onabort = tx.onerror = () =>
+      reject(tx.error ?? new Error("Maintenance transaction failed"));
+  });
+}
+
+/** Same UTC time one calendar month ago, clamped to the last day of that month. */
+export function visitCutoff(now: number): number {
+  const date = new Date(now);
+  const day = date.getUTCDate();
+  date.setUTCDate(1);
+  date.setUTCMonth(date.getUTCMonth() - 1);
+  const lastDay = new Date(
+    Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 0),
+  ).getUTCDate();
+  date.setUTCDate(Math.min(day, lastDay));
+  return date.getTime();
+}
+
+/** Short transactions delete only expired visits; no X records or evidence are touched. */
+export async function pruneVisits(now = Date.now()): Promise<number> {
+  const db = await database();
+  const cutoff = visitCutoff(now);
+  let total = 0;
+  let count: number;
+  do {
+    count = 0;
+    const tx = db.transaction("events", "readwrite");
+    const finished = complete(tx);
+    const req = tx
+      .objectStore("events")
+      .index("kindAt")
+      .openCursor(
+        IDBKeyRange.bound(["visit", 0], ["visit", cutoff], false, true),
+      );
+    req.onsuccess = () => {
+      const cursor = req.result;
+      if (!cursor) return;
+      cursor.delete();
+      count++;
+      if (count < BATCH) cursor.continue();
+    };
+    await finished;
+    total += count;
+    if (count === BATCH) await new Promise((resolve) => setTimeout(resolve, 0));
+  } while (count === BATCH);
+  return total;
+}
+
+/** Resume legacy snapshot compaction across worker shutdowns. Never re-ingest events or alter counts. */
+export async function compactSnapshots(maxBatches = 100): Promise<void> {
+  const db = await database();
+  for (let batch = 0; batch < maxBatches; batch++) {
+    const meta = db.transaction("meta").objectStore("meta");
+    const [finished, after] = await Promise.all([
+      read(meta.get(COMPACTION_DONE)),
+      read(meta.get(COMPACTION_CURSOR)),
+    ]);
+    if (finished) return;
+    const events: StoredEvent[] = await read(
+      db
+        .transaction("events")
+        .objectStore("events")
+        .getAll(after ? IDBKeyRange.lowerBound(after, true) : undefined, BATCH),
+    );
+    const keys = await Promise.all(
+      events.map((event) =>
+        event.post && !event.textKey ? snapshotKey(event.post.text) : undefined,
+      ),
+    );
+    const tx = db.transaction(["events", "texts", "meta"], "readwrite");
+    const done = complete(tx);
+    events.forEach((event, i) => {
+      if (!keys[i]) return;
+      // Deletion may have happened while hashing. Never resurrect a removed event.
+      const req = tx.objectStore("events").get(event.id);
+      req.onsuccess = () => {
+        if (req.result && !req.result.textKey)
+          tx.objectStore("events").put(storeSnapshot(tx, req.result, keys[i]));
+      };
+    });
+    if (events.length)
+      tx.objectStore("meta").put(events.at(-1)!.id, COMPACTION_CURSOR);
+    if (events.length < BATCH)
+      tx.objectStore("meta").put(true, COMPACTION_DONE);
+    await done;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+}
+
+/** Apply legacy unlike commands using the same timestamp and reference safeguards as ingestion. */
+export async function removeUnlikeHistory(): Promise<void> {
+  const db = await database();
+  while (true) {
+    const events: StoredEvent[] = await read(
+      db
+        .transaction("events")
+        .objectStore("events")
+        .index("kind")
+        .getAll("unlike", BATCH),
+    );
+    if (!events.length) return;
+    await saveEvents(events);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+}
+
+let running: Promise<void> | undefined;
+export function maintainActivity(): Promise<void> {
+  return (running ??= (async () => {
+    await pruneVisits();
+    await removeUnlikeHistory();
+    await removeExposureContent();
+    await compactSnapshots();
+  })().finally(() => {
+    running = undefined;
+  }));
+}
+
+/** Remove legacy non-news visits only after a valid catalog is available. */
+export async function pruneNonNewsVisits(catalog: NewsCatalog): Promise<void> {
+  const db = await database();
+  if (
+    (await read(
+      db.transaction("meta").objectStore("meta").get("newsVisitsVersion"),
+    )) === catalog.version
+  )
+    return;
+  const matches = newsMatcher(catalog);
+  let after: IDBValidKey | undefined;
+  let more: boolean;
+  do {
+    more = false;
+    let scanned = 0;
+    const tx = db.transaction("events", "readwrite");
+    const finished = complete(tx);
+    const req = tx
+      .objectStore("events")
+      .index("kind")
+      .openCursor(IDBKeyRange.only("visit"));
+    req.onsuccess = () => {
+      const cursor = req.result;
+      if (!cursor) return;
+      if (after && indexedDB.cmp(cursor.primaryKey, after) < 0) {
+        cursor.continuePrimaryKey("visit", after);
+        return;
+      }
+      if (after && indexedDB.cmp(cursor.primaryKey, after) === 0) {
+        cursor.continue();
+        return;
+      }
+      if (!matches(cursor.value.url)) cursor.delete();
+      if (++scanned >= BATCH) {
+        after = cursor.primaryKey;
+        more = true;
+        return;
+      }
+      cursor.continue();
+    };
+    await finished;
+    if (more) await new Promise((resolve) => setTimeout(resolve, 0));
+  } while (more);
+  const tx = db.transaction("meta", "readwrite");
+  tx.objectStore("meta").put(catalog.version, "newsVisitsVersion");
+  await complete(tx);
+}
+
+/** Remove legacy exposure content in resumable, short transactions. */
+export async function removeExposureContent(maxBatches = 100): Promise<void> {
+  const db = await database();
+  for (const store of ["events", "posts"] as const) {
+    const marker = `exposureContentCleanup:${store}`;
+    for (let batch = 0; batch < maxBatches; batch++) {
+      const progress = await read(
+        db.transaction("meta").objectStore("meta").get(marker),
+      );
+      if (progress?.done) break;
+      const tx = db.transaction(
+        ["events", "posts", "texts", "meta"],
+        "readwrite",
+      );
+      const finished = complete(tx);
+      let count = 0;
+      const req = tx
+        .objectStore(store)
+        .openCursor(
+          progress?.after
+            ? IDBKeyRange.lowerBound(progress.after, true)
+            : undefined,
+        );
+      req.onsuccess = () => {
+        const cursor = req.result;
+        if (!cursor) {
+          tx.objectStore("meta").put({ done: true }, marker);
+          return;
+        }
+        if (store === "events") {
+          const event = cursor.value as StoredEvent;
+          if (
+            event.kind === "exposure" &&
+            event.post &&
+            !isOwnPost(event.post)
+          ) {
+            const { textKey, ...original } = event;
+            cursor.update(stripExposureContent(original));
+            if (textKey) {
+              // The index reflects the update above; retain text still used by a like/own post.
+              const refs = tx
+                .objectStore("events")
+                .index("textKey")
+                .count(textKey);
+              refs.onsuccess = () => {
+                if (!refs.result) tx.objectStore("texts").delete(textKey);
+              };
+            }
+          }
+        } else {
+          const post = cursor.value as StoredPost;
+          if (!isOwnPost(post)) {
+            const text = post.liked ? (post.likedText ?? post.text) : "";
+            cursor.update({
+              ...post,
+              text,
+              tokens: tokens(text),
+              likedText: post.liked ? text : undefined,
+              likedTokens: post.liked ? tokens(text) : [],
+              embedding: post.liked ? post.embedding : undefined,
+              embeddingVersion: post.liked ? post.embeddingVersion : undefined,
+              preferenceAt: post.liked ? post.preferenceAt : undefined,
+            });
+          }
+        }
+        tx.objectStore("meta").put({ after: cursor.primaryKey }, marker);
+        if (++count < BATCH) cursor.continue();
+      };
+      await finished;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+  }
+}

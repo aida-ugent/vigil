@@ -1,0 +1,3272 @@
+import type { StoredEvent } from "../src/activity/snapshots";
+import { DEFAULT_SETTINGS, SETTINGS_KEY } from "../src/shared/settings";
+import type { ContentAnalysisResult } from "../src/shared/content";
+import { eng } from "stopword";
+import type { LLMService } from "../src/llm/types";
+import { ConfirmationAnalysisService } from "../src/sidepanel/confirmationAnalysisService";
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { webcrypto } from "node:crypto";
+import "fake-indexeddb/auto";
+import { IDBIndex } from "fake-indexeddb";
+import { isRuntimeRequestMessage } from "../src/shared/messages";
+import { JSDOM } from "jsdom";
+import {
+  saveEvents,
+  clearActivity,
+  related,
+  activitySummary,
+  exportActivity,
+  revision,
+  browseActivity,
+  pendingEmbeddings,
+  saveEmbeddings,
+} from "../src/activity/database";
+import {
+  cleanUrl,
+  tokens,
+  eventSchema,
+  EMBEDDING_DIMS,
+  SIMILARITY_FLOOR,
+  type ActivityEvent,
+  type StoredPost,
+  type AccountStats,
+} from "../src/activity/model";
+import { detectConfirmationBias } from "../src/plugins/confirmationBias";
+import { startActivityCollection } from "../src/activity/collector";
+Object.defineProperty(globalThis, "crypto", { value: webcrypto });
+function event(
+  kind: ActivityEvent["kind"],
+  id = "123",
+  at = Date.now(),
+  author = "alice",
+): ActivityEvent {
+  return {
+    id: crypto.randomUUID(),
+    kind,
+    at,
+    url: "https://x.com/home",
+    session: "session",
+    post: {
+      id,
+      author,
+      viewer: "reader",
+      text: "Solar energy climate research supports renewable investment",
+      url: `https://x.com/${author}/status/${id}`,
+    },
+  };
+}
+/** Synthetic unit vectors: the retriever only requires L2-normalized input, not real embeddings. */
+function vector(...weights: number[]): Float32Array {
+  const full = Float32Array.from(
+    { length: EMBEDDING_DIMS },
+    (_, i) => weights[i] ?? 0,
+  );
+  const norm = Math.hypot(...full) || 1;
+  return full.map((value) => value / norm);
+}
+async function seed() {
+  await clearActivity();
+  await saveEvents(
+    Array.from({ length: 6 }, (_, i) =>
+      event(
+        "like",
+        `${100 + i}`,
+        Date.UTC(2026, 9, 1 + (i % 2)),
+        i % 2 ? "alice" : "bob",
+      ),
+    ),
+  );
+}
+test("upgrades existing activity without losing likes and backfills the preference index", async () => {
+  await new Promise<void>((resolve, reject) => {
+    const open = indexedDB.open("vigil-activity", 1);
+    open.onupgradeneeded = () => {
+      const db = open.result;
+      const events = db.createObjectStore("events", { keyPath: "id" });
+      events.createIndex("at", "at");
+      events.createIndex("kind", "kind");
+      const posts = db.createObjectStore("posts", { keyPath: "key" });
+      posts.createIndex("author", "author");
+      posts.createIndex("tokens", "tokens", { multiEntry: true });
+      posts.createIndex("likedTokens", "likedTokens", { multiEntry: true });
+      db.createObjectStore("accounts", { keyPath: "key" });
+      db.createObjectStore("meta");
+      posts.put({
+        ...event("like", "124", 1000, "bob").post!,
+        key: "reader:124",
+        at: 1000,
+        liked: true,
+        likedAt: 1000,
+        text: "Solar energy",
+        likedText: "Solar energy",
+        tokens: [],
+        likedTokens: [],
+      });
+      posts.put({
+        ...event("like").post!,
+        key: "reader:123",
+        at: 1000,
+        liked: true,
+        likedAt: 1000,
+        likedText: "our and are you the for",
+        text: "our and are you the for",
+        tokens: ["our", "and", "are", "you", "the", "for"],
+        likedTokens: ["our", "and", "are", "you", "the", "for"],
+      });
+    };
+    open.onerror = () => reject(open.error);
+    open.onsuccess = () => {
+      open.result.close();
+      resolve();
+    };
+  });
+  assert.equal((await related("our and are you the for")).posts.length, 0);
+  assert.deepEqual(
+    (await related("solar energy")).posts.map((p) => p.id),
+    ["124"],
+  );
+  // v4 backfills the synchronous key during the upgrade; vectors are left to the drain.
+  const pending = await pendingEmbeddings(10);
+  assert.deepEqual(new Set(pending.map((p) => p.id)), new Set(["123", "124"]));
+  assert.ok(pending.every((p) => p.embedding === undefined));
+});
+test("deduplicates retried events and updates same-account counts atomically", async () => {
+  await clearActivity();
+  const first = event("exposure");
+  await saveEvents([
+    first,
+    first,
+    event("exposure", "124"),
+    event("like"),
+    event("like"),
+  ]);
+  const summary = await activitySummary();
+  assert.equal(summary.events, 3);
+  assert.equal(summary.posts, 2);
+  assert.equal(summary.accounts[0].exposures, 2);
+  assert.equal(summary.accounts[0].likes, 1);
+});
+test("unlikes remove preference evidence; late exposure does not suppress an earlier like", async () => {
+  await clearActivity();
+  await saveEvents([
+    event("exposure", "123", 3000),
+    event("like", "123", 2000),
+  ]);
+  assert.equal((await related("solar energy")).posts[0].liked, true);
+  await saveEvents([event("unlike", "123", 4000), event("like", "123", 1000)]);
+  assert.equal(
+    (await related("solar energy")).posts.some((p) => p.liked),
+    false,
+  );
+  assert.equal((await activitySummary()).accounts[0].likes, 0);
+});
+test("gates on topic, distinct posts and viewing identity", async () => {
+  await seed();
+  assert.equal((await related("solar energy climate")).ready, true);
+  assert.equal((await related("football championship")).ready, false);
+  assert.equal(
+    (await related("solar energy climate", undefined, "100")).posts.some(
+      (p) => p.id === "100",
+    ),
+    false,
+  );
+  const extra = event("like", "500");
+  extra.post!.viewer = "another-reader";
+  await saveEvents([extra]);
+  assert.equal((await related("solar energy climate")).ready, false);
+  await clearActivity();
+  await saveEvents(
+    Array.from({ length: 6 }, (_, i) =>
+      event("like", `${i}`, Date.now(), "alice"),
+    ),
+  );
+  assert.equal((await related("solar energy")).ready, true);
+});
+test("two distinct relevant likes qualify on the same day", async () => {
+  await clearActivity();
+  const at = Date.UTC(2026, 9, 16, 12);
+  const likes = Array.from({ length: 2 }, (_, i) =>
+    event("like", `${200 + i}`, at, i % 2 ? "alice" : "bob"),
+  );
+  await saveEvents(likes.slice(0, 1));
+  assert.equal((await related("solar energy climate")).ready, false);
+  await saveEvents(likes.slice(1));
+  assert.equal((await related("solar energy climate")).ready, true);
+});
+test("keeps liked text immutable during subsequent exposures; export includes original events", async () => {
+  await seed();
+  const before = await revision();
+  const exposure = event("exposure", "100");
+  exposure.post!.text = "Changed text";
+  await saveEvents([exposure]);
+  assert.equal(await revision(), before);
+  const evidence = await related("solar energy");
+  assert.match(
+    evidence.posts.find((p) => p.id === "100")!.likedText!,
+    /Solar energy/,
+  );
+  const rows = (await (await exportActivity()).text())
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  assert.equal(rows.filter((r) => r.type === "events").length, 7);
+  await clearActivity();
+  assert.notEqual(await revision(), before);
+  assert.equal((await activitySummary()).events, 0);
+});
+test("sanitizes navigation URLs and rejects malformed ingestion payloads", () => {
+  assert.equal(
+    cleanUrl("https://example.com/path?token=secret#private"),
+    "https://example.com/path",
+  );
+  assert.equal(cleanUrl("chrome://settings"), null);
+  assert.equal(
+    eventSchema.safeParse({ ...event("like"), post: { id: "invalid" } })
+      .success,
+    false,
+  );
+});
+test("confirmation detector abstains before readiness and validates spans and evidence citations", async () => {
+  await seed();
+  const evidence = await related("solar energy");
+  let calls = 0;
+  const text = "Ignore every study questioning solar energy.";
+  let output = {
+    findings: [
+      {
+        term: "Ignore every study",
+        explanation:
+          "Possible selective dismissal consistent with the cited likes; likes are uncertain evidence.",
+        confidence: 0.8,
+        support: "weak",
+        evidenceIds: evidence.posts.slice(0, 2).map((p) => p.key),
+      },
+    ],
+  };
+  const llm: LLMService = {
+    complete: async () => "",
+    isAvailable: () => true,
+    backend: "local-api",
+    completeJSON: async (system, user, parse) => {
+      calls++;
+      assert.match(system, /untrusted/);
+      assert.match(user, /history/);
+      return parse(JSON.stringify(output));
+    },
+  };
+  assert.deepEqual(
+    await detectConfirmationBias(text, { ...evidence, ready: false }, llm),
+    [],
+  );
+  assert.equal(calls, 0);
+  const findings = await detectConfirmationBias(text, evidence, llm);
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].spanStart, 0);
+  output.findings[0].evidenceIds = ["invented", "invented2"];
+  assert.deepEqual(await detectConfirmationBias(text, evidence, llm), []);
+  output.findings[0].evidenceIds = evidence.posts.slice(0, 2).map((p) => p.key);
+  output.findings[0].term = "hallucinated phrase";
+  assert.deepEqual(await detectConfirmationBias(text, evidence, llm), []);
+});
+test("activity browser filters by account and content and paginates without duplicates", async () => {
+  await clearActivity();
+  await saveEvents(
+    Array.from({ length: 70 }, (_, i) => event("like", `${1000 + i}`)),
+  );
+  const first = await browseActivity({
+    kind: "posts",
+    author: "@alice",
+    query: "solar energy",
+  });
+  assert.equal(first.rows.length, 50);
+  assert.ok(first.next);
+  const second = await browseActivity({
+    kind: "posts",
+    author: "alice",
+    query: "solar energy",
+    after: first.next,
+  });
+  assert.equal(second.rows.length, 20);
+  assert.equal(
+    new Set([...first.rows, ...second.rows].map((p) => p.data.id)).size,
+    70,
+  );
+  assert.equal(
+    (await browseActivity({ kind: "posts", query: "football" })).rows.length,
+    0,
+  );
+  assert.equal(
+    (await browseActivity({ kind: "posts", author: "bob" })).rows.length,
+    0,
+  );
+});
+test("collector is opt-in, requires dwell, captures media-only posts and stops when disabled", async () => {
+  const dom = new JSDOM(
+    `<body><a data-testid="AppTabBar_Profile_Link" href="/reader"></a><article data-testid="tweet"><a href="/alice/status/123"><time>Today</time></a><img alt="A solar panel" /></article></body>`,
+    { url: "https://x.com/home", pretendToBeVisual: true },
+  );
+  for (const name of [
+    "window",
+    "document",
+    "location",
+    "Element",
+    "MutationObserver",
+  ])
+    Object.defineProperty(globalThis, name, {
+      value: dom.window[name],
+      configurable: true,
+    });
+  Object.defineProperty(globalThis, "innerHeight", {
+    value: 900,
+    configurable: true,
+  });
+  dom.window.document.hasFocus = () => true;
+  let onStorage: (
+    changes: Record<string, chrome.storage.StorageChange>,
+    area: string,
+  ) => void;
+  let intersect: (
+    entries: Array<{
+      target: Element;
+      intersectionRect: { height: number };
+      boundingClientRect: { height: number };
+    }>,
+  ) => void;
+  let observations = 0;
+  const batches: ActivityEvent[][] = [];
+  Object.defineProperty(globalThis, "chrome", {
+    configurable: true,
+    value: {
+      storage: {
+        local: { get: async () => ({}) },
+        onChanged: {
+          addListener: (fn) => {
+            onStorage = fn;
+          },
+        },
+      },
+      runtime: {
+        sendMessage: async (m) => {
+          batches.push(m.payload.events);
+          return { type: "ACTIVITY_ACK", payload: { ok: true } };
+        },
+      },
+    },
+  });
+  Object.defineProperty(globalThis, "IntersectionObserver", {
+    configurable: true,
+    value: class {
+      constructor(fn) {
+        intersect = fn;
+      }
+      observe() {
+        observations++;
+      }
+      unobserve() {}
+      disconnect() {}
+    },
+  });
+  startActivityCollection();
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(observations, 0);
+  onStorage!(
+    { vigilActivitySettingsV1: { newValue: { tracking: true } } },
+    "local",
+  );
+  assert.equal(observations, 1);
+  const article = document.querySelector("article")!;
+  intersect!([
+    {
+      target: article,
+      intersectionRect: { height: 100 },
+      boundingClientRect: { height: 100 },
+    },
+  ]);
+  await new Promise((r) => setTimeout(r, 1100));
+  assert.equal(batches.length, 1);
+  assert.equal(
+    batches[0][0].post!.text,
+    "",
+    "media alt text is not retained for exposures",
+  );
+  assert.equal(batches[0][0].post!.viewer, "reader");
+  onStorage!(
+    { vigilActivitySettingsV1: { newValue: { tracking: false } } },
+    "local",
+  );
+  dom.window.close();
+});
+
+test("server discovery uses loaded and newly typed URLs instead of the initial default", async () => {
+  const dom = new JSDOM(
+    '<div id="browser-plugins-list"></div><input id="server-url"><span id="server-status-dot"></span><div id="server-plugins-list"></div><select id="llm-backend"><option value="none">Disabled</option></select>',
+  );
+  for (const name of [
+    "window",
+    "document",
+    "Element",
+    "HTMLInputElement",
+    "HTMLSelectElement",
+    "HTMLButtonElement",
+  ])
+    Object.defineProperty(globalThis, name, {
+      value: dom.window[name],
+      configurable: true,
+    });
+  const { DEFAULT_SETTINGS, SETTINGS_KEY } = await import(
+    "../src/shared/settings"
+  );
+  let current = { ...DEFAULT_SETTINGS };
+  let stored = current;
+  const urls: string[] = [];
+  const statuses: string[] = [];
+  Object.defineProperty(globalThis, "chrome", {
+    configurable: true,
+    value: {
+      runtime: {
+        onMessage: { addListener() {} },
+        sendMessage: async (message) => {
+          urls.push(message.payload.url);
+          return {
+            payload: {
+              ok: true,
+              status: 200,
+              body: JSON.stringify({ analyzers: [] }),
+            },
+          };
+        },
+      },
+      storage: {
+        sync: {
+          get: async () => ({ [SETTINGS_KEY]: stored }),
+          set: async (value) => {
+            stored = value[SETTINGS_KEY];
+          },
+        },
+      },
+    },
+  });
+  const { createSettingsController } = await import(
+    "../src/sidepanel/settingsController"
+  );
+  const controller = createSettingsController({
+    getCurrentSettings: () => current,
+    setCurrentSettings: (s) => {
+      current = s;
+    },
+    onSaveStatus() {},
+    onPanelStatus: (message) => statuses.push(message),
+    onDiagnosticsChanged() {},
+  });
+  current = { ...current, serverUrl: "http://127.0.0.1:18787" };
+  controller.render(current);
+  await controller.checkServerAndLoadPlugins();
+  assert.deepEqual(urls, [
+    "http://127.0.0.1:18787/health",
+    "http://127.0.0.1:18787/plugins",
+  ]);
+  assert.equal(
+    document.querySelector<HTMLSelectElement>("#llm-backend")!.value,
+    "none",
+  );
+  document.querySelector<HTMLInputElement>("#server-url")!.value =
+    "http://127.0.0.1:28787";
+  await controller.checkServerAndLoadPlugins();
+  assert.equal(urls.at(-1), "http://127.0.0.1:28787/plugins");
+  assert.equal(stored.serverUrl, "http://127.0.0.1:28787");
+  assert.match(statuses.at(-1)!, /Connected/);
+  const cb = document.querySelector<HTMLInputElement>(
+    'input[data-plugin-id="confirmation-bias-llm"]',
+  )!;
+  assert.ok(cb, "CB is rendered in the Plugins list");
+  assert.equal(cb.checked, false, "CB defaults to opt-in");
+  cb.checked = true;
+  cb.dispatchEvent(new dom.window.Event("change"));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.ok(stored.selectedBrowserPlugins.includes("confirmation-bias-llm"));
+  cb.checked = false;
+  cb.dispatchEvent(new dom.window.Event("change"));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.ok(!stored.selectedBrowserPlugins.includes("confirmation-bias-llm"));
+
+  dom.window.close();
+});
+
+// JSDOM cannot create trusted user events. Capture the DOM listener and provide
+// the browser trust bit at that boundary; button changes still use real mutations.
+test("collector records like/unlike transitions and ignores unchanged or synthetic clicks", async () => {
+  const dom = new JSDOM(
+    `<body><a data-testid="AppTabBar_Profile_Link" href="/reader"></a><article data-testid="tweet"><a href="/alice/status/123"><time>Today</time></a><div data-testid="tweetText">Solar energy research</div><button data-testid="like"></button></article></body>`,
+    { url: "https://x.com/home", pretendToBeVisual: true },
+  );
+  for (const name of [
+    "window",
+    "document",
+    "location",
+    "Element",
+    "MutationObserver",
+  ]) {
+    Object.defineProperty(globalThis, name, {
+      value: dom.window[name],
+      configurable: true,
+    });
+  }
+  dom.window.document.hasFocus = () => true;
+  const batches: ActivityEvent[][] = [];
+  let changeSettings: (
+    changes: Record<string, chrome.storage.StorageChange>,
+    area: string,
+  ) => void;
+  let clickListener: EventListener;
+  const addListener = document.addEventListener.bind(document);
+  document.addEventListener = ((
+    type: string,
+    listener: EventListener,
+    options?: boolean | AddEventListenerOptions,
+  ) => {
+    if (type === "click") clickListener = listener;
+    addListener(type, listener, options);
+  }) as typeof document.addEventListener;
+  Object.defineProperty(globalThis, "chrome", {
+    configurable: true,
+    value: {
+      storage: {
+        local: {
+          get: async () => ({ vigilActivitySettingsV1: { tracking: true } }),
+        },
+        onChanged: {
+          addListener: (listener) => {
+            changeSettings = listener;
+          },
+        },
+      },
+      runtime: {
+        sendMessage: async (message) => {
+          batches.push(message.payload.events);
+          return { type: "ACTIVITY_ACK", payload: { ok: true } };
+        },
+      },
+    },
+  });
+  Object.defineProperty(globalThis, "IntersectionObserver", {
+    configurable: true,
+    value: class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    },
+  });
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+  startActivityCollection();
+  await tick();
+  const button = document.querySelector("button")!;
+  const click = () =>
+    clickListener!({ target: button, isTrusted: true } as unknown as Event);
+  try {
+    click();
+    await tick();
+    assert.equal(batches.length, 0, "click alone does not prove a like");
+    button.setAttribute("data-testid", "unlike");
+    await tick();
+    assert.equal(batches[0][0].kind, "like");
+    assert.equal(batches[0][0].post!.text, "Solar energy research");
+    assert.equal(batches[0][0].post!.viewer, "reader");
+
+    click();
+    button.setAttribute("data-testid", "like");
+    await tick();
+    assert.equal(batches[1][0].kind, "unlike");
+
+    button.dispatchEvent(new dom.window.MouseEvent("click", { bubbles: true }));
+    button.setAttribute("data-testid", "unlike");
+    await tick();
+    assert.equal(
+      batches.length,
+      2,
+      "synthetic clicks do not become interactions",
+    );
+
+    changeSettings!(
+      { vigilActivitySettingsV1: { newValue: { tracking: false } } },
+      "local",
+    );
+    click();
+    button.setAttribute("data-testid", "like");
+    await tick();
+    assert.equal(
+      batches.length,
+      2,
+      "pausing collection stops interaction events",
+    );
+  } finally {
+    changeSettings!(
+      { vigilActivitySettingsV1: { newValue: { tracking: false } } },
+      "local",
+    );
+    dom.window.close();
+  }
+});
+
+test("confirmation service discards results when history changes during inference", async () => {
+  await seed();
+  Object.defineProperty(globalThis, "chrome", {
+    configurable: true,
+    value: {
+      storage: enabledConfirmationStorage(),
+    },
+  });
+  let finishInference: () => void;
+  let notifyStarted: () => void;
+  const started = new Promise<void>((resolve) => {
+    notifyStarted = resolve;
+  });
+  const waiting = new Promise<void>((resolve) => {
+    finishInference = resolve;
+  });
+  const llm: LLMService = {
+    backend: "local-api",
+    isAvailable: () => true,
+    complete: async () => "",
+    completeJSON: async (_system, _user, parse) => {
+      notifyStarted!();
+      await waiting;
+      return parse('{"findings":[]}');
+    },
+  };
+  let applied = false;
+  const service = new ConfirmationAnalysisService({
+    isCurrent: () => true,
+    onStatus() {},
+    onResult: async () => {
+      applied = true;
+    },
+  });
+  const item = {
+    id: "999",
+    platform: "twitter" as const,
+    text: "solar energy research",
+    pageUrl: "https://x.com/home",
+  };
+  const running = service.analyze({
+    item,
+    generation: 1,
+    tabId: 1,
+    llm,
+    base: {
+      id: item.id,
+      text: item.text,
+      findings: [],
+      tips: [],
+      elapsedMs: 0,
+      cached: false,
+    },
+  });
+  await started;
+  await saveEvents([event("unlike", "100")]);
+  finishInference!();
+  await running;
+  assert.equal(applied, false);
+});
+
+test("confirmation service runs only the latest pending item and keeps existing findings", async () => {
+  await seed();
+  Object.defineProperty(globalThis, "chrome", {
+    configurable: true,
+    value: {
+      storage: enabledConfirmationStorage(),
+    },
+  });
+  let finishFirst: () => void;
+  let notifyStarted: () => void;
+  let notifyApplied: () => void;
+  const started = new Promise<void>((resolve) => {
+    notifyStarted = resolve;
+  });
+  const waiting = new Promise<void>((resolve) => {
+    finishFirst = resolve;
+  });
+  const applied = new Promise<void>((resolve) => {
+    notifyApplied = resolve;
+  });
+  let calls = 0;
+  const llm: LLMService = {
+    backend: "local-api",
+    isAvailable: () => true,
+    complete: async () => "",
+    completeJSON: async (_system, _user, parse) => {
+      if (++calls === 1) {
+        notifyStarted!();
+        await waiting;
+      }
+      return parse('{"findings":[]}');
+    },
+  };
+  const ids: string[] = [];
+  const service = new ConfirmationAnalysisService({
+    isCurrent: () => true,
+    onStatus() {},
+    onResult: async (request, result) => {
+      ids.push(result.id);
+      assert.deepEqual(result.findings, request.base.findings);
+      if (result.id === "third") notifyApplied!();
+    },
+  });
+  const request = (id: string) => ({
+    item: {
+      id,
+      platform: "generic" as const,
+      text: "solar energy research",
+      pageUrl: "https://example.com",
+    },
+    generation: 1,
+    tabId: 1,
+    llm,
+    base: {
+      id,
+      text: "solar energy research",
+      findings: [
+        {
+          term: "solar",
+          label: "Existing finding",
+          explanation: "Existing detector",
+          severity: "low" as const,
+          pluginId: "existing",
+        },
+      ],
+      tips: [],
+      elapsedMs: 0,
+      cached: false,
+    },
+  });
+  const running = service.analyze(request("first"));
+  await started;
+  await service.analyze(request("second"));
+  await service.analyze(request("third"));
+  finishFirst!();
+  await running;
+  await applied;
+  assert.deepEqual(ids, ["first", "third"]);
+  assert.equal(calls, 2);
+});
+
+test("indexed pagination seeks to later pages without replaying earlier records", async () => {
+  await clearActivity();
+  await saveEvents(
+    Array.from({ length: 300 }, (_, i) => event("exposure", `${1000 + i}`)),
+  );
+  const original = IDBIndex.prototype.openCursor;
+  let visited = 0;
+  IDBIndex.prototype.openCursor = function (...args) {
+    const request = original.apply(this, args);
+    request.addEventListener("success", () => {
+      visited++;
+    });
+    return request;
+  };
+  try {
+    const page = await browseActivity({
+      kind: "posts",
+      author: "alice",
+      after: "reader:1249",
+    });
+    assert.equal(page.rows.length, 50);
+    assert.equal(page.rows[0].data.id, "1250");
+    assert.ok(
+      visited <= 53,
+      `Visited ${visited} cursor positions for 50 results`,
+    );
+  } finally {
+    IDBIndex.prototype.openCursor = original;
+  }
+});
+
+test("activity runtime messages reject malformed records and oversized batches", () => {
+  assert.equal(
+    isRuntimeRequestMessage({
+      type: "ACTIVITY_BATCH",
+      payload: { events: [event("like")] },
+    }),
+    true,
+  );
+  assert.equal(isRuntimeRequestMessage({ type: "ACTIVITY_CLEAR" }), true);
+  assert.equal(
+    isRuntimeRequestMessage({
+      type: "ACTIVITY_BATCH",
+      payload: { events: [{ id: "bad" }] },
+    }),
+    false,
+  );
+  assert.equal(
+    isRuntimeRequestMessage({
+      type: "ACTIVITY_BATCH",
+      payload: { events: Array.from({ length: 51 }, () => event("like")) },
+    }),
+    false,
+  );
+});
+
+test("retrieval uses liked and authored posts, excludes exposures and the current post", async () => {
+  await clearActivity();
+  await saveEvents([
+    event("exposure", "700", Date.now(), "reader"),
+    event("exposure", "701"),
+    event("like", "702"),
+  ]);
+  let evidence = await related("solar energy climate");
+  assert.equal(evidence.ready, true);
+  assert.deepEqual(
+    new Set(evidence.posts.map((p) => p.id)),
+    new Set(["700", "702"]),
+  );
+  assert.equal(
+    (await related("solar energy climate", undefined, "700")).ready,
+    false,
+  );
+  await saveEvents([event("unlike", "702")]);
+  assert.equal((await related("solar energy climate")).ready, false);
+  await saveEvents([event("exposure", "703", Date.now(), "reader")]);
+  evidence = await related("solar energy climate");
+  assert.equal(evidence.ready, true); // Own-post-only history can qualify.
+  assert.ok(evidence.posts.every((p) => p.author === "reader" && !p.liked));
+  const before = await revision();
+  await saveEvents([event("exposure", "703", Date.now(), "reader")]);
+  assert.equal(await revision(), before); // Repeat exposure should not cancel inference.
+  const changed = event("exposure", "703", Date.now() + 1, "reader");
+  changed.post!.text += " Additional context.";
+  await saveEvents([changed]);
+  assert.notEqual(await revision(), before);
+});
+
+test("model context contains only liked/authored evidence and rejects unsupported or duplicate citations", async () => {
+  await seed();
+  const evidence = await related("solar energy climate");
+  const own = {
+    ...evidence.posts[0],
+    key: "reader:800",
+    id: "800",
+    author: "reader",
+    liked: false,
+  };
+  const exposure = {
+    ...evidence.posts[1],
+    key: "reader:801",
+    id: "801",
+    liked: false,
+  };
+  evidence.posts = [own, ...evidence.posts, exposure];
+  const text = "Solar energy saves every home money without exception.";
+  let refs = [own.key, evidence.posts[1].key];
+  const llm: LLMService = {
+    backend: "local-api",
+    isAvailable: () => true,
+    complete: async () => "",
+    completeJSON: async (system, user, parse) => {
+      assert.match(system, /support PRESENTED IN THE CURRENT POST/);
+      assert.match(system, /subjective preference alone/);
+      const context = JSON.parse(user);
+      assert.ok(context.history.every((p) => p.key !== exposure.key));
+      assert.equal(context.history[0].basis, "authored");
+      return parse(
+        JSON.stringify({
+          findings: [
+            {
+              term: text,
+              explanation:
+                "This may reinforce your support for solar energy; no evidence for the universal savings claim is shown.",
+              confidence: 0.8,
+              support: "absent",
+              evidenceIds: refs,
+            },
+          ],
+        }),
+      );
+    },
+  };
+  assert.equal((await detectConfirmationBias(text, evidence, llm)).length, 1);
+  refs = [own.key, own.key];
+  assert.deepEqual(await detectConfirmationBias(text, evidence, llm), []);
+  refs = [own.key, exposure.key];
+  assert.deepEqual(await detectConfirmationBias(text, evidence, llm), []);
+});
+
+test("CB badge is separate from phrase highlights, supports hover/focus/click, and clears recycled posts", async () => {
+  const { highlightTweetFindings, clearAllHighlights } = await import(
+    "../src/content/highlighter"
+  );
+  const dom = new JSDOM(
+    '<body><article data-testid="tweet"><a href="/alice/status/900"><time>Now</time></a><div data-testid="tweetText">Solar energy always saves money.</div></article></body>',
+    { url: "https://x.com/home", pretendToBeVisual: true },
+  );
+  for (const name of [
+    "window",
+    "document",
+    "Element",
+    "HTMLElement",
+    "HTMLAnchorElement",
+    "Node",
+    "NodeFilter",
+    "MutationObserver",
+  ])
+    Object.defineProperty(globalThis, name, {
+      configurable: true,
+      value: dom.window[name],
+    });
+  Object.defineProperty(globalThis, "getComputedStyle", {
+    configurable: true,
+    value: dom.window.getComputedStyle.bind(dom.window),
+  });
+  Object.defineProperty(globalThis, "innerWidth", {
+    configurable: true,
+    value: 1024,
+  });
+  Object.defineProperty(globalThis, "innerHeight", {
+    configurable: true,
+    value: 768,
+  });
+  dom.window.matchMedia = (() => ({
+    matches: false,
+    addEventListener() {},
+    removeEventListener() {},
+  })) as any;
+  const article = document.querySelector("article")!;
+  let navigated = false;
+  article.addEventListener("click", () => {
+    navigated = true;
+  });
+  const result = {
+    tweetId: "900",
+    text: "Solar energy always saves money.",
+    tips: [],
+    elapsedMs: 0,
+    findings: [
+      {
+        term: "always",
+        label: "Ordinary detector",
+        explanation: "Existing highlight",
+        severity: "low" as const,
+        pluginId: "ordinary",
+        spanStart: 13,
+        spanEnd: 19,
+      },
+      {
+        term: "Solar energy always saves money.",
+        label: "Possible confirmation bias",
+        explanation:
+          "<img src=x onerror=alert(1)> No universal savings evidence shown.",
+        severity: "medium" as const,
+        pluginId: "confirmation-bias-llm",
+        spanStart: 0,
+        spanEnd: 31,
+      },
+    ],
+  };
+  // Test-only access to internals. Production retains the closed root solely
+  // in its content-script closure and exposes no DOM property or test hook.
+  const roots = new WeakMap<Element, ShadowRoot>();
+  const attachShadow = dom.window.Element.prototype.attachShadow;
+  dom.window.Element.prototype.attachShadow = function (options: ShadowRootInit) {
+    const root = attachShadow.call(this, options);
+    roots.set(this, root);
+    return root;
+  };
+  try {
+    assert.equal(highlightTweetFindings([result]).totalHighlights, 2);
+    assert.equal(document.querySelectorAll("mark").length, 1);
+    const host = document.querySelector<HTMLElement>(
+      "[data-vigil-confirmation-badge]",
+    )!;
+    assert.equal(host.nextElementSibling, article.querySelector('[data-testid="tweetText"]'));
+    assert.equal(host.style.position, "relative");
+    assert.equal(host.style.top, "");
+    assert.equal(host.style.right, "");
+    const header = document.createElement("div");
+    header.style.display = "flex";
+    header.innerHTML = '<div data-testid="User-Name">Alice</div><div data-action="grok"><button aria-label="Grok actions">Grok</button></div><div><button data-testid="caret">More</button></div>';
+    article.prepend(header);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const more = header.querySelector('[data-testid="caret"]')!;
+    assert.equal(host.parentElement, more.parentElement);
+    assert.equal(host.nextElementSibling, more);
+    const follow = document.createElement("div");
+    follow.innerHTML = '<button data-testid="123-follow">Follow</button>';
+    header.insertBefore(follow, header.querySelector('[data-action="grok"]'));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(host.nextElementSibling, more);
+    assert.equal(host.style.alignSelf, "center");
+    // Match the supplied X markup: an outer space-between header, then a
+    // nested actions row and several wrappers around the More icon.
+    const controls = document.createElement("div");
+    controls.innerHTML = '<div style="display:flex;justify-content:space-between"><div data-slot="follow"></div><div data-slot="grok"></div><div><div><div data-slot="more" style="display:flex;flex-direction:row"></div></div></div></div>';
+    header.append(controls);
+    controls.querySelector('[data-slot="follow"]')!.append(follow);
+    controls.querySelector('[data-slot="grok"]')!.append(header.querySelector('[data-action="grok"]')!);
+    controls.querySelector('[data-slot="more"]')!.append(more);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(host.parentElement, controls.querySelector('[data-slot="more"]'));
+    assert.equal(host.nextElementSibling, more);
+    assert.equal(host.shadowRoot, null);
+    assert.equal(host.textContent, "");
+    assert.ok(!article.outerHTML.includes(result.findings[1].explanation));
+    const root = roots.get(host)!;
+    assert.equal(root.mode, "closed");
+    const button = root.querySelector("button")!;
+    const tooltip = root.querySelector<HTMLElement>('[role="tooltip"]')!;
+    assert.equal(button.textContent, "CB?");
+    assert.equal(tooltip.hidden, true);
+    assert.equal(tooltip.querySelector("p")!.textContent, "");
+    host.dispatchEvent(new dom.window.MouseEvent("pointerenter", { clientX: 400, clientY: 200 }));
+    assert.equal(tooltip.hidden, false);
+    assert.equal(tooltip.getAttribute("popover"), "manual");
+    assert.equal(tooltip.style.left, "400px");
+    assert.equal(tooltip.style.top, "208px");
+    assert.match(tooltip.textContent!, /Possible confirmation-bias risk/);
+    assert.equal(root.querySelector("img"), null);
+    assert.equal(tooltip.querySelector("p")!.textContent, result.findings[1].explanation);
+    assert.equal(host.shadowRoot, null);
+    assert.ok(!document.body.innerHTML.includes("No universal savings evidence shown."));
+    host.dispatchEvent(new dom.window.Event("pointerleave"));
+    assert.equal(tooltip.hidden, true);
+    assert.equal(tooltip.querySelector("p")!.textContent, "");
+    button.focus();
+    assert.equal(tooltip.hidden, false);
+    button.dispatchEvent(
+      new dom.window.KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+    );
+    assert.equal(tooltip.hidden, true);
+    button.click();
+    assert.equal(tooltip.hidden, false);
+    assert.equal(navigated, false);
+    // Events from inside a closed root still include its host for outside-click handling.
+    tooltip.dispatchEvent(new dom.window.MouseEvent("pointerdown", { bubbles: true, composed: true }));
+    assert.equal(tooltip.hidden, false);
+    document.body.dispatchEvent(new dom.window.MouseEvent("pointerdown", { bubbles: true, composed: true }));
+    assert.equal(tooltip.hidden, true);
+    assert.equal(tooltip.querySelector("p")!.textContent, "");
+    button.click();
+    button.click();
+    assert.equal(tooltip.hidden, true);
+    highlightTweetFindings([result]);
+    assert.equal(
+      document.querySelectorAll("[data-vigil-confirmation-badge]").length,
+      1,
+    );
+    article.querySelector("a")!.href = "/bob/status/901";
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(
+      document.querySelector("[data-vigil-confirmation-badge]"),
+      null,
+    );
+    article.querySelector("a")!.href = "/alice/status/900";
+    highlightTweetFindings([result]);
+    clearAllHighlights();
+    assert.equal(
+      document.querySelector("[data-vigil-confirmation-badge]"),
+      null,
+    );
+    assert.equal(document.querySelector("mark"), null);
+  } finally {
+    clearAllHighlights();
+    dom.window.Element.prototype.attachShadow = attachShadow;
+    dom.window.close();
+  }
+});
+
+test("diagnostics capture the exact sent context and model output without provider credentials", async () => {
+  const { ConfirmationDiagnostics } = await import(
+    "../src/diagnostics/confirmation"
+  );
+  await seed();
+  Object.defineProperty(globalThis, "chrome", {
+    configurable: true,
+    value: { storage: enabledConfirmationStorage() },
+  });
+  const diagnostics = new ConfirmationDiagnostics();
+  let sentSystem = "",
+    sentUser = "";
+  const llm: LLMService = {
+    backend: "local-api",
+    isAvailable: () => true,
+    complete: async () => "",
+    completeJSON: async (system, user, parse) => {
+      sentSystem = system;
+      sentUser = user;
+      assert.equal(diagnostics.get()!.stage, "calling");
+      return parse('{"findings":[]}');
+    },
+  };
+  const item = {
+    id: "999",
+    text: "solar energy climate",
+    pageUrl: "https://x.com/home",
+    platform: "twitter" as const,
+  };
+  const base = {
+    id: item.id,
+    text: item.text,
+    findings: [],
+    tips: [],
+    elapsedMs: 0,
+    cached: false,
+  };
+  const service = new ConfirmationAnalysisService(
+    { isCurrent: () => true, onStatus() {}, onResult: async () => {} },
+    diagnostics,
+  );
+  await service.analyze({
+    item,
+    base,
+    generation: 1,
+    tabId: 1,
+    llm,
+    model: "test-model",
+  });
+  const trace = diagnostics.get()!;
+  assert.equal(trace.stage, "completed");
+  assert.match(trace.reason, /abstained/);
+  assert.equal(trace.request!.system, sentSystem);
+  assert.equal(trace.request!.user, sentUser);
+  assert.equal(trace.responses[0].text, '{"findings":[]}');
+  assert.equal(trace.model, "test-model");
+  assert.ok(trace.retrieved.every((p) => p.matchedTerms.includes("solar")));
+  assert.ok(JSON.parse(sentUser).history.every((p) => p.basis === "liked"));
+  assert.equal("llm" in trace, false);
+  assert.equal("headers" in trace.request!, false);
+});
+
+test("diagnostics distinguish skipped checks, invalid responses, and private provider errors", async () => {
+  const { ConfirmationDiagnostics } = await import(
+    "../src/diagnostics/confirmation"
+  );
+  await clearActivity();
+  Object.defineProperty(globalThis, "chrome", {
+    configurable: true,
+    value: { storage: enabledConfirmationStorage() },
+  });
+  const diagnostics = new ConfirmationDiagnostics();
+  let mode = "invalid";
+  const llm: LLMService = {
+    backend: "local-api",
+    isAvailable: () => true,
+    complete: async () => "",
+    completeJSON: async (_system, _user, parse) => {
+      if (mode === "error") throw new Error("private-api-key-do-not-record");
+      return parse("not JSON");
+    },
+  };
+  const item = {
+    id: "999",
+    text: "solar energy climate",
+    pageUrl: "https://x.com/home",
+    platform: "twitter" as const,
+  };
+  const base = {
+    id: item.id,
+    text: item.text,
+    findings: [],
+    tips: [],
+    elapsedMs: 0,
+    cached: false,
+  };
+  const service = new ConfirmationAnalysisService(
+    { isCurrent: () => true, onStatus() {}, onResult: async () => {} },
+    diagnostics,
+  );
+  const request = { item, base, generation: 1, tabId: 1, llm };
+  await service.analyze(request);
+  assert.equal(diagnostics.get()!.stage, "skipped");
+  assert.equal(diagnostics.get()!.request, undefined);
+  await seed();
+  const warn = console.warn;
+  console.warn = () => {};
+  try {
+    await service.analyze(request);
+    assert.equal(diagnostics.get()!.stage, "failed");
+    assert.equal(diagnostics.get()!.responses[0].text, "not JSON");
+    assert.match(diagnostics.get()!.validation[0], /not valid JSON/);
+    mode = "error";
+    await service.analyze(request);
+    assert.equal(diagnostics.get()!.stage, "failed");
+    assert.ok(!JSON.stringify(diagnostics.get()).includes("private-api-key"));
+  } finally {
+    console.warn = warn;
+  }
+});
+
+test("cleared or replaced diagnostics cannot be repopulated by a late response", async () => {
+  const { ConfirmationDiagnostics } = await import(
+    "../src/diagnostics/confirmation"
+  );
+  const diagnostics = new ConfirmationDiagnostics();
+  const current = {
+    id: "1",
+    text: "private text",
+    pageUrl: "https://x.com/home",
+  };
+  const first = diagnostics.begin(current, "local-api");
+  diagnostics.clear();
+  diagnostics.update(first, { reason: "late private response" });
+  assert.equal(diagnostics.get(), null);
+  const second = diagnostics.begin({ ...current, id: "2" }, "local-api");
+  diagnostics.update(first, { stage: "completed" });
+  assert.equal(diagnostics.get()!.id, second);
+  assert.equal(diagnostics.get()!.stage, "retrieving");
+});
+
+test("diagnostics view renders model text safely and separates candidates from sent context", async () => {
+  const { renderConfirmationTrace } = await import("../src/diagnostics/view");
+  const { ConfirmationDiagnostics } = await import(
+    "../src/diagnostics/confirmation"
+  );
+  const dom = new JSDOM('<body><div id="trace"></div></body>');
+  Object.defineProperty(globalThis, "document", {
+    configurable: true,
+    value: dom.window.document,
+  });
+  const target = document.getElementById("trace")!;
+  const diagnostics = new ConfirmationDiagnostics();
+  const id = diagnostics.begin(
+    { id: "1", text: "test", pageUrl: "https://x.com/home" },
+    "local-api",
+  );
+  diagnostics.update(id, {
+    retrieved: [
+      {
+        key: "p",
+        author: "alice",
+        text: "<img src=x onerror=alert(1)>",
+        url: "javascript:alert(1)",
+        basis: "liked",
+        matchedTerms: ["solar"],
+      },
+    ],
+  });
+  renderConfirmationTrace(target, diagnostics.get());
+  assert.match(target.textContent!, /not sent/);
+  assert.equal(target.querySelector("img"), null);
+  assert.equal(target.querySelector("a"), null);
+  diagnostics.update(id, {
+    request: {
+      system: "test",
+      user: JSON.stringify({
+        currentContent: "test",
+        history: [
+          {
+            key: "sent",
+            author: "bob",
+            text: "Actual sent excerpt",
+            url: "https://x.com/bob/status/2",
+            basis: "authored",
+          },
+        ],
+      }),
+      options: {},
+    },
+  });
+  renderConfirmationTrace(target, diagnostics.get());
+  assert.match(target.textContent!, /Tweets sent to the LLM/);
+  assert.match(target.textContent!, /Actual sent excerpt/);
+  assert.doesNotMatch(target.textContent!, /@alice/);
+  assert.equal(target.querySelector("a")!.rel, "noopener noreferrer");
+  dom.window.close();
+});
+
+test("common words never contribute context matches", async () => {
+  assert.deepEqual(tokens("OUR and ARE you THE for our"), []);
+  assert.deepEqual(tokens("Our solar and energy are for you"), [
+    "solar",
+    "energy",
+  ]);
+  await clearActivity();
+  const rows = [event("like", "910"), event("like", "911")];
+  rows.forEach((row) => {
+    row.post!.text = "Our cats and dogs are for you";
+  });
+  await saveEvents(rows);
+  assert.equal(
+    (await related("Our solar and energy are for you")).posts.length,
+    0,
+  );
+});
+
+test("semantic retrieval finds posts sharing no keywords, and the floor preserves abstention", async () => {
+  await clearActivity();
+  const rows = [event("like", "940", 1000), event("like", "941", 2000)];
+  rows[0].post!.text = "Electric cars pollute less than petrol";
+  rows[1].post!.text = "Battery vehicles cut tailpipe emissions";
+  await saveEvents(rows);
+  // No shared meaningful tokens, so the lexical pass alone retrieves nothing for this phrasing.
+  assert.equal((await related("EVs are cleaner")).posts.length, 0);
+  await saveEmbeddings([
+    { key: "reader:940", embedding: vector(1, 0.1), text: rows[0].post!.text },
+    { key: "reader:941", embedding: vector(1, 0.2), text: rows[1].post!.text },
+  ]);
+  const semantic = await related("EVs are cleaner", vector(1, 0.15));
+  assert.deepEqual(
+    new Set(semantic.posts.map((p) => p.id)),
+    new Set(["940", "941"]),
+  );
+  assert.equal(semantic.retrievalMethod, "semantic");
+  assert.equal(semantic.ready, true);
+  assert.ok(semantic.similarity!["reader:940"] > SIMILARITY_FLOOR);
+  // A distant query abstains instead of returning its nearest remaining neighbours.
+  assert.equal(
+    (await related("EVs are cleaner", vector(0, 1))).posts.length,
+    0,
+  );
+});
+
+test("hybrid retrieval keeps qualifying posts from either pass", async () => {
+  await clearActivity();
+  const rows = [event("like", "960", 1000), event("like", "961", 2000)];
+  rows[1].post!.text = "Wind turbines reduce emissions";
+  await saveEvents(rows);
+  await saveEmbeddings([
+    { key: "reader:961", embedding: vector(1), text: rows[1].post!.text },
+  ]);
+  const evidence = await related("solar energy climate", vector(1));
+  assert.equal(evidence.retrievalMethod, "hybrid");
+  assert.deepEqual(
+    new Set(evidence.posts.map((p) => p.id)),
+    new Set(["960", "961"]),
+  );
+  assert.equal(evidence.similarity!["reader:961"], 1);
+  assert.equal(evidence.similarity!["reader:960"], undefined); // A keyword-only match carries no cosine.
+});
+
+test("the backlog lists only preference posts and drops vectors when their text changes", async () => {
+  await clearActivity();
+  const text = "Solar energy climate research supports renewable investment";
+  await saveEvents([
+    event("like", "950", 1000),
+    event("exposure", "951", 1000, "bob"),
+  ]);
+  // Ordinary exposures never reach the model, so they never enter the embedding backlog.
+  assert.deepEqual(
+    (await pendingEmbeddings(10)).map((p) => p.id),
+    ["950"],
+  );
+  await saveEmbeddings([{ key: "reader:950", embedding: vector(1), text }]);
+  assert.deepEqual(
+    (await pendingEmbeddings(10)).map((p) => p.id),
+    [],
+  );
+  const edited = event("like", "950", 2000);
+  edited.post!.text = "Solar energy climate research now reports the opposite";
+  await saveEvents([edited]);
+  assert.deepEqual(
+    (await pendingEmbeddings(10)).map((p) => p.id),
+    ["950"],
+  );
+});
+
+test("mixed or unknown viewing identities are never merged into one preference profile", async () => {
+  await clearActivity();
+  const rows = [event("like", "930"), event("like", "931")];
+  rows[1].post!.viewer = "another-reader";
+  await saveEvents(rows);
+  assert.equal((await related("solar energy climate")).ready, false);
+  await clearActivity();
+  rows.forEach((row) => {
+    row.post!.viewer = "unknown";
+  });
+  await saveEvents(rows);
+  assert.equal((await related("solar energy climate")).ready, false);
+});
+
+test("filler terms carried by most of the corpus no longer qualify a post as evidence", async () => {
+  await clearActivity();
+  // 24 posts, so document frequencies become meaningful, all carrying the same two filler words.
+  await saveEvents(
+    Array.from({ length: 24 }, (_, i) => {
+      const row = event("like", `${600 + i}`, 1000 + i);
+      row.post!.text = `This will be a full account of topic${i} and subject${i}`;
+      return row;
+    }),
+  );
+  // "will" and "full" survive the 108-word stopword list but discriminate nothing here.
+  const filler = await related("this will be full");
+  assert.deepEqual(filler.queryTerms, []);
+  assert.equal(filler.posts.length, 0);
+  // Terms unique to one post still retrieve it; the filler words alongside them are ignored.
+  const rare = await related("topic3 subject3 will full");
+  assert.deepEqual(rare.queryTerms, ["topic3", "subject3"]);
+  assert.deepEqual(
+    rare.posts.map((p) => p.id),
+    ["603"],
+  );
+});
+
+test("retrieval excludes the library's English stopwords without altering post text", () => {
+  assert.deepEqual(tokens(eng.join(" ")), []);
+  assert.deepEqual(tokens("The solar energy policy is for our community"), [
+    "solar",
+    "energy",
+    "policy",
+    "community",
+  ]);
+  assert.deepEqual(tokens("https twitter com solar energy"), [
+    "solar",
+    "energy",
+  ]);
+});
+
+test("dashboard distinguishes repeated exposures and unique likes", async () => {
+  const { createSummary } = await import("../src/activity/analytics");
+  const accumulator = createSummary({
+    from: 100,
+    to: 300,
+    viewer: "reader",
+    surface: "home-feed",
+  });
+  const events = [
+    event("exposure", "1", 200),
+    event("exposure", "1", 201),
+    event("like", "1", 202),
+    event("unlike", "1", 203),
+    event("like", "1", 204),
+    event("exposure", "2", 205, "bob"),
+  ];
+  events.forEach((e) => {
+    e.context = "home-feed";
+    accumulator.add(e);
+  });
+  accumulator.add({ ...event("exposure", "3", 206), context: "thread" });
+  accumulator.add({
+    ...event("like", "4", 207),
+    context: "home-feed",
+    post: { ...event("like").post!, viewer: "other" },
+  });
+  accumulator.add({ ...event("like", "5", 400), context: "home-feed" });
+  accumulator.add({
+    id: crypto.randomUUID(),
+    kind: "visit",
+    at: 210,
+    url: "https://example.com/path",
+    session: "session",
+  });
+  const result = accumulator.result();
+  assert.equal(result.exposures, 3);
+  assert.equal(result.uniqueSeen, 2);
+  assert.equal(result.likedPosts, 1);
+  assert.equal(result.likeActions, 2);
+  assert.equal(result.visits, 1);
+  assert.deepEqual(result.viewers, ["other", "reader"]);
+  assert.equal(result.accounts.find((a) => a.author === "alice")!.exposures, 2);
+  assert.equal(
+    result.days.reduce((n, d) => n + d.likeActions, 0),
+    2,
+  );
+});
+
+test("dashboard record drilldowns combine date, author, viewer, surface and text filters", async () => {
+  const { matchesRecord, localDay } = await import("../src/activity/analytics");
+  const item = { ...event("like", "1", 200), context: "home-feed" };
+  const filter = {
+    from: 100,
+    to: 300,
+    viewer: "reader",
+    surface: "home-feed" as const,
+    kind: "like" as const,
+    author: "@Alice",
+    query: "solar",
+    day: localDay(200),
+    domain: "",
+  };
+  assert.equal(matchesRecord(item, filter), true);
+  for (const change of [
+    { author: "bob" },
+    { viewer: "other" },
+    { from: 250 },
+    { query: "absent" },
+    { domain: "example.com" },
+    { day: "2020-01-01" },
+  ]) {
+    assert.equal(matchesRecord(item, { ...filter, ...change }), false);
+  }
+  const visit = {
+    id: crypto.randomUUID(),
+    kind: "visit" as const,
+    at: 200,
+    url: "https://example.com/path",
+    title: "Example",
+    session: "s",
+  };
+  assert.equal(
+    matchesRecord(visit, {
+      ...filter,
+      kind: "visit",
+      author: "",
+      query: "example",
+      domain: "example.com",
+    }),
+    true,
+  );
+});
+
+test("dashboard indexed pagination preserves events sharing timestamps", async () => {
+  const { dashboardRecords, dashboardSummary } = await import(
+    "../src/activity/analytics"
+  );
+  await clearActivity();
+  const events = Array.from({ length: 112 }, (_, i) =>
+    event("exposure", String(i), 200),
+  );
+  await saveEvents(events);
+  const filter = {
+    from: 100,
+    to: 300,
+    viewer: "",
+    surface: "all" as const,
+    kind: "all" as const,
+    author: "",
+    query: "",
+    day: "",
+    domain: "",
+  };
+  const ids: string[] = [];
+  let after;
+  do {
+    const page = await dashboardRecords(filter, after);
+    ids.push(...page.rows.map((e) => e.id));
+    after = page.next;
+  } while (after);
+  assert.equal(ids.length, 112);
+  assert.equal(new Set(ids).size, 112);
+  assert.deepEqual(
+    ids,
+    events
+      .map((e) => e.id)
+      .sort()
+      .reverse(),
+  );
+  assert.equal((await dashboardSummary(filter)).exposures, 112);
+  assert.equal((await dashboardSummary({ ...filter, from: 201 })).exposures, 0);
+  await assert.rejects(
+    dashboardSummary({ ...filter, from: 400 }),
+    /valid date range/,
+  );
+});
+
+test("chart buttons expose counts, safely render labels and activate drilldowns", async () => {
+  const { renderBars } = await import("../src/activity/charts");
+  const previousDocument = globalThis.document;
+  const dom = new JSDOM("<div id='chart'></div>");
+  Object.defineProperty(globalThis, "document", {
+    value: dom.window.document,
+    configurable: true,
+  });
+  try {
+    const chart = document.getElementById("chart")!;
+    let selected = "";
+    renderBars(
+      chart,
+      [{ key: "alice", label: "<img src=x onerror=alert(1)>", value: 3 }],
+      6,
+      (key) => {
+        selected = key;
+      },
+    );
+    assert.equal(chart.querySelector("img"), null);
+    assert.match(
+      chart.querySelector("button")!.getAttribute("aria-label")!,
+      /3, 50%/,
+    );
+    chart.querySelector("button")!.click();
+    assert.equal(selected, "alice");
+    renderBars(chart, [], 0, () => {});
+    assert.match(chart.textContent!, /No activity/);
+  } finally {
+    Object.defineProperty(globalThis, "document", {
+      value: previousDocument,
+      configurable: true,
+    });
+    dom.window.close();
+  }
+});
+
+test("first semantic check indexes history before retrieval and reports remaining work", async () => {
+  const { prepareEmbedding } = await import("../src/activity/embeddingRequest");
+  await clearActivity();
+  const rows = [
+    event("like", "810", 1000),
+    event("like", "811", 2000),
+    event("like", "812", 3000),
+  ];
+  rows.forEach((row) => {
+    row.post!.text = "Battery vehicles reduce tailpipe emissions";
+  });
+  await saveEvents(rows);
+  const order: string[] = [];
+  const result = await prepareEmbedding(
+    { query: "EVs are cleaner", drain: 2 },
+    {
+      async drain(limit) {
+        order.push("drain");
+        const posts = await pendingEmbeddings(limit);
+        await saveEmbeddings(
+          posts.map((post) => ({
+            key: post.key,
+            embedding: vector(1),
+            text: post.text,
+          })),
+        );
+        return 1;
+      },
+      async embed() {
+        order.push("query");
+        assert.equal((await pendingEmbeddings(10)).length, 1);
+        return [vector(1)];
+      },
+    },
+  );
+  assert.deepEqual(order, ["drain", "query"]);
+  assert.equal(result.pending, 1);
+  assert.equal(
+    (await related("EVs are cleaner", Float32Array.from(result.vector!))).ready,
+    true,
+  );
+});
+
+test("embedding writes reject malformed vectors and ignore concurrently unliked posts", async () => {
+  await clearActivity();
+  const row = event("like", "820", 1000);
+  await saveEvents([row]);
+  for (const invalid of [
+    new Float32Array(2),
+    new Float32Array(384),
+    Float32Array.from({ length: 384 }, () => NaN),
+  ]) {
+    await assert.rejects(
+      saveEmbeddings([
+        { key: "reader:820", embedding: invalid, text: row.post!.text },
+      ]),
+      /Invalid embedding/,
+    );
+  }
+  assert.equal((await pendingEmbeddings(10)).length, 1);
+  await saveEvents([event("unlike", "820", 2000)]);
+  await saveEmbeddings([
+    { key: "reader:820", embedding: vector(1), text: row.post!.text },
+  ]);
+  assert.equal((await related("EVs are cleaner", vector(1))).posts.length, 0);
+});
+
+test("embedding messages bound model input and drain sizes", async () => {
+  const { isOffscreenRequestMessage } = await import(
+    "../src/offscreen/messages"
+  );
+  for (const payload of [
+    { drain: -1 },
+    { drain: 33 },
+    { drain: 1.5 },
+    { drain: Infinity },
+    { query: "x".repeat(1501) },
+  ]) {
+    assert.equal(
+      isRuntimeRequestMessage({ type: "ACTIVITY_EMBED", payload }),
+      false,
+    );
+    assert.equal(
+      isOffscreenRequestMessage({ type: "OFFSCREEN_EMBED", payload }),
+      false,
+    );
+  }
+  assert.equal(
+    isOffscreenRequestMessage({
+      type: "OFFSCREEN_EMBED",
+      payload: { query: "test", drain: 32 },
+    }),
+    true,
+  );
+});
+
+test("strong semantic matches outrank weaker matches boosted by keywords", async () => {
+  await clearActivity();
+  const strong = event("like", "830", 1000);
+  strong.post!.text = "Battery vehicles reduce tailpipe emissions";
+  const weak = event("like", "831", 2000);
+  weak.post!.text = "Electric cars appear in this unrelated advert";
+  await saveEvents([strong, weak]);
+  await saveEmbeddings([
+    { key: "reader:830", embedding: vector(1, 0.1), text: strong.post!.text },
+    { key: "reader:831", embedding: vector(0.5, 0.8), text: weak.post!.text },
+  ]);
+  const result = await related("Electric cars", vector(1));
+  assert.deepEqual(
+    result.posts.map((p) => p.id),
+    ["830", "831"],
+  );
+  assert.equal(result.matchMethods!["reader:830"], "semantic");
+  assert.equal(result.matchMethods!["reader:831"], "hybrid");
+});
+
+test("background backfill coalesces starts and drains remaining history without another analysis", async () => {
+  const { EmbeddingBackfill } = await import("../src/activity/backfill");
+  let calls = 0;
+  let busy = true;
+  const backfill = new EmbeddingBackfill(
+    async () => (++calls < 3 ? 1 : 0),
+    () => busy,
+    async () => true,
+    1,
+  );
+  backfill.start();
+  backfill.start();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(calls, 0);
+  busy = false;
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(calls, 3);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(calls, 3);
+});
+
+test("background backfill stops on disable or failure instead of retrying forever", async () => {
+  const { EmbeddingBackfill } = await import("../src/activity/backfill");
+  let calls = 0;
+  const disabled = new EmbeddingBackfill(
+    async () => {
+      calls++;
+      return 1;
+    },
+    () => false,
+    async () => false,
+    1,
+  );
+  disabled.start();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(calls, 0);
+  const broken = new EmbeddingBackfill(
+    async () => {
+      calls++;
+      throw new Error("unavailable");
+    },
+    () => false,
+    async () => true,
+    1,
+  );
+  broken.start();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(calls, 1);
+});
+
+test("legacy unit vectors are reindexed even when dimensions and norm are valid", async () => {
+  const { database } = await import("../src/activity/database");
+  const { EMBEDDING_VERSION } = await import("../src/activity/model");
+  await clearActivity();
+  const row = event("like", "840", 1000);
+  await saveEvents([row]);
+  await saveEmbeddings([
+    { key: "reader:840", embedding: vector(1), text: row.post!.text },
+  ]);
+  const db = await database();
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction("posts", "readwrite");
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    const get = tx.objectStore("posts").get("reader:840");
+    get.onsuccess = () =>
+      tx
+        .objectStore("posts")
+        .put({ ...get.result, embeddingVersion: "old-webgpu-encoder" });
+  });
+  assert.equal((await pendingEmbeddings(10)).length, 1);
+  assert.equal(
+    (await related("unrelated paraphrase", vector(1))).posts.length,
+    0,
+  );
+  await saveEmbeddings([
+    { key: "reader:840", embedding: vector(1), text: row.post!.text },
+  ]);
+  assert.equal((await pendingEmbeddings(10)).length, 0);
+  const evidence = await related("unrelated paraphrase", vector(1));
+  assert.equal(evidence.posts[0].embeddingVersion, EMBEDDING_VERSION);
+  await saveEvents([event("exposure", "840", 2000)]);
+  assert.equal((await pendingEmbeddings(10)).length, 0);
+});
+
+test("keyword fallback reports its actual below-floor cosine rather than a missing score", async () => {
+  await clearActivity();
+  const row = event("like", "850", 1000);
+  await saveEvents([row]);
+  await saveEmbeddings([
+    { key: "reader:850", embedding: vector(0.1, 1), text: row.post!.text },
+  ]);
+  const result = await related("solar energy climate", vector(1));
+  assert.equal(result.posts.length, 1);
+  assert.equal(result.matchMethods!["reader:850"], "lexical");
+  assert.ok(
+    result.similarity!["reader:850"] > 0 &&
+      result.similarity!["reader:850"] < SIMILARITY_FLOOR,
+  );
+});
+
+test("short-list stopword omissions do not qualify unrelated posts in a small history", async () => {
+  await clearActivity();
+  const row = event("like", "860", 1000);
+  row.post!.text = "Our conference will have a full program";
+  await saveEvents([row]);
+  assert.equal(
+    (await related("The full invasion will not be enough")).posts.length,
+    0,
+  );
+  assert.deepEqual(tokens("will just really enough full"), []);
+});
+
+test("dashboard worker failures reject pending and subsequent requests", async () => {
+  const { AnalyticsClient } = await import("../src/activity/analyticsClient");
+  class FakeWorker extends EventTarget {
+    messages: unknown[] = [];
+    terminated = false;
+    postMessage(message: unknown) {
+      this.messages.push(message);
+    }
+    terminate() {
+      this.terminated = true;
+    }
+  }
+  const worker = new FakeWorker();
+  const client = new AnalyticsClient(worker as unknown as Worker);
+  const filter = { from: 0, to: 100, viewer: "", surface: "all" as const };
+  const first = client.request({ type: "summary", filter });
+  const rejection = assert.rejects(first, /Reopen this page/);
+  worker.dispatchEvent(new Event("error"));
+  await rejection;
+  await assert.rejects(
+    client.request({ type: "summary", filter }),
+    /Reopen this page/,
+  );
+  assert.equal(worker.terminated, true);
+  assert.equal(worker.messages.length, 1);
+});
+
+test("dashboard worker correlates out-of-order responses and handles deserialization failures", async () => {
+  const { AnalyticsClient } = await import("../src/activity/analyticsClient");
+  class FakeWorker extends EventTarget {
+    messages: Array<{ id: number }> = [];
+    postMessage(message: { id: number }) {
+      this.messages.push(message);
+    }
+    terminate() {}
+  }
+  const worker = new FakeWorker();
+  const client = new AnalyticsClient(worker as unknown as Worker);
+  const filter = {
+    from: 0,
+    to: 100,
+    viewer: "",
+    surface: "all" as const,
+    kind: "all" as const,
+    author: "",
+    query: "",
+    day: "",
+    domain: "",
+  };
+  const first = client.request({ type: "records", filter });
+  const second = client.request({ type: "records", filter });
+  worker.dispatchEvent(
+    new MessageEvent("message", {
+      data: {
+        id: worker.messages[1].id,
+        type: "records",
+        result: { rows: [] },
+      },
+    }),
+  );
+  assert.deepEqual(await second, { rows: [] });
+  const rejection = assert.rejects(first, /Reopen this page/);
+  worker.dispatchEvent(new Event("messageerror"));
+  await rejection;
+});
+
+test("large dashboard scans yield to queued activity writes without losing timestamp ties", async () => {
+  const { dashboardSummary } = await import("../src/activity/analytics");
+  await clearActivity();
+  await saveEvents(
+    Array.from({ length: 1001 }, (_, i) =>
+      event("exposure", String(9000 + i), 100),
+    ),
+  );
+  const original = IDBIndex.prototype.openCursor;
+  let write: Promise<void> | undefined;
+  let written = false;
+  IDBIndex.prototype.openCursor = function (...args) {
+    const req = original.apply(this, args);
+    if (this.name === "at" && !write) {
+      req.addEventListener(
+        "success",
+        () => {
+          if (!write)
+            write = saveEvents([event("exposure", "99999", 300)]).then(() => {
+              written = true;
+            });
+        },
+        { once: true },
+      );
+    }
+    return req;
+  };
+  try {
+    const result = await dashboardSummary({
+      from: 0,
+      to: 200,
+      viewer: "",
+      surface: "all",
+    });
+    assert.equal(result.exposures, 1001);
+    assert.equal(result.uniqueSeen, 1001);
+    assert.equal(
+      written,
+      true,
+      "queued writes should complete before the full scan",
+    );
+    await write;
+  } finally {
+    IDBIndex.prototype.openCursor = original;
+  }
+});
+
+test(
+  "cloud CB inference overlaps ordinary analysis but waits to merge its findings",
+  { timeout: 2000 },
+  async () => {
+    await seed();
+    Object.defineProperty(globalThis, "chrome", {
+      configurable: true,
+      value: {
+        storage: enabledConfirmationStorage(),
+      },
+    });
+    const { ConfirmationDiagnostics } = await import(
+      "../src/diagnostics/confirmation"
+    );
+    const diagnostics = new ConfirmationDiagnostics();
+    let start!: () => void;
+    const started = new Promise<void>((resolve) => {
+      start = resolve;
+    });
+    let publishBase!: (value: ContentAnalysisResult) => void;
+    const baseReady = new Promise<ContentAnalysisResult>((resolve) => {
+      publishBase = resolve;
+    });
+    const item = {
+      id: "parallel",
+      text: "solar energy research",
+      platform: "generic" as const,
+      pageUrl: "https://example.com",
+    };
+    const base: ContentAnalysisResult = {
+      id: item.id,
+      text: item.text,
+      findings: [],
+      tips: [],
+      elapsedMs: 0,
+      cached: false,
+    };
+    let applied: ContentAnalysisResult | undefined;
+    const llm: LLMService = {
+      backend: "cloud-api",
+      isAvailable: () => true,
+      complete: async () => "",
+      completeJSON: async (_system, _user, parse) => {
+        start();
+        return parse('{"findings":[]}');
+      },
+    };
+    const service = new ConfirmationAnalysisService(
+      {
+        isCurrent: () => true,
+        onStatus() {},
+        onResult: async (_request, result) => {
+          applied = result;
+        },
+      },
+      diagnostics,
+    );
+    const running = service.analyze({
+      item,
+      base,
+      baseReady,
+      llm,
+      generation: 1,
+      tabId: 1,
+    });
+    await started;
+    assert.equal(
+      applied,
+      undefined,
+      "must not replace ordinary findings before they arrive",
+    );
+    const finding = {
+      term: "solar",
+      label: "Existing",
+      explanation: "Existing result",
+      severity: "low" as const,
+      pluginId: "existing",
+    };
+    publishBase({ ...base, findings: [finding] });
+    await running;
+    assert.deepEqual(applied!.findings, [finding]);
+    for (const stage of [
+      "queueMs",
+      "embeddingMs",
+      "retrievalMs",
+      "inferenceMs",
+      "baseWaitMs",
+    ]) {
+      assert.ok(diagnostics.get()!.timings![stage] >= 0);
+    }
+  },
+);
+
+for (const backend of ["local-api", "webllm"] as const) {
+  test(
+    `${backend} CB prepares context early but waits before shared-model generation`,
+    { timeout: 2000 },
+    async () => {
+      await seed();
+      Object.defineProperty(globalThis, "chrome", {
+        configurable: true,
+        value: {
+          storage: enabledConfirmationStorage(),
+        },
+      });
+      const { ConfirmationDiagnostics } = await import(
+        "../src/diagnostics/confirmation"
+      );
+      const diagnostics = new ConfirmationDiagnostics();
+      let retrieved!: () => void;
+      const ready = new Promise<void>((resolve) => {
+        retrieved = resolve;
+      });
+      diagnostics.subscribe(() => {
+        if (diagnostics.get()?.timings?.retrievalMs !== undefined) retrieved();
+      });
+      let publishBase!: (value: ContentAnalysisResult) => void;
+      const baseReady = new Promise<ContentAnalysisResult>((resolve) => {
+        publishBase = resolve;
+      });
+      const item = {
+        id: "serial",
+        text: "solar energy research",
+        platform: "generic" as const,
+        pageUrl: "https://example.com",
+      };
+      const base: ContentAnalysisResult = {
+        id: item.id,
+        text: item.text,
+        findings: [],
+        tips: [],
+        elapsedMs: 0,
+        cached: false,
+      };
+      let calls = 0;
+      const llm: LLMService = {
+        backend,
+        isAvailable: () => true,
+        complete: async () => "",
+        completeJSON: async (_system, _user, parse) => {
+          calls++;
+          return parse('{"findings":[]}');
+        },
+      };
+      const service = new ConfirmationAnalysisService(
+        { isCurrent: () => true, onStatus() {}, onResult: async () => {} },
+        diagnostics,
+      );
+      const running = service.analyze({
+        item,
+        base,
+        baseReady,
+        llm,
+        generation: 1,
+        tabId: 1,
+      });
+      await ready;
+      assert.equal(calls, 0);
+      publishBase(base);
+      await running;
+      assert.equal(calls, 1);
+    },
+  );
+}
+
+test(
+  "cloud results are discarded if the request becomes obsolete while awaiting ordinary results",
+  { timeout: 2000 },
+  async () => {
+    await seed();
+    Object.defineProperty(globalThis, "chrome", {
+      configurable: true,
+      value: {
+        storage: enabledConfirmationStorage(),
+      },
+    });
+    let start!: () => void;
+    const started = new Promise<void>((resolve) => {
+      start = resolve;
+    });
+    let publishBase!: (value: ContentAnalysisResult) => void;
+    const baseReady = new Promise<ContentAnalysisResult>((resolve) => {
+      publishBase = resolve;
+    });
+    const item = {
+      id: "obsolete",
+      text: "solar energy research",
+      platform: "generic" as const,
+      pageUrl: "https://example.com",
+    };
+    const base: ContentAnalysisResult = {
+      id: item.id,
+      text: item.text,
+      findings: [],
+      tips: [],
+      elapsedMs: 0,
+      cached: false,
+    };
+    let current = true,
+      applied = false;
+    const llm: LLMService = {
+      backend: "cloud-api",
+      isAvailable: () => true,
+      complete: async () => "",
+      completeJSON: async (_system, _user, parse) => {
+        start();
+        return parse('{"findings":[]}');
+      },
+    };
+    const service = new ConfirmationAnalysisService({
+      isCurrent: () => current,
+      onStatus() {},
+      onResult: async () => {
+        applied = true;
+      },
+    });
+    const running = service.analyze({
+      item,
+      base,
+      baseReady,
+      llm,
+      generation: 1,
+      tabId: 1,
+    });
+    await started;
+    current = false;
+    publishBase(base);
+    await running;
+    assert.equal(applied, false);
+  },
+);
+
+for (const disableAt of [
+  "before",
+  "retrieval",
+  "waiting",
+  "inference",
+] as const) {
+  test(
+    `CB plugin stops new requests when disabled ${disableAt} and can be re-enabled`,
+    { timeout: 2000 },
+    async () => {
+      await seed();
+      let enabled = disableAt !== "before";
+      let embeddingCalls = 0;
+      let llmCalls = 0;
+      let applied = 0;
+      const settings = () => ({
+        ...DEFAULT_SETTINGS,
+        selectedBrowserPlugins: enabled ? ["confirmation-bias-llm"] : [],
+      });
+      Object.defineProperty(globalThis, "chrome", {
+        configurable: true,
+        value: {
+          storage: {
+            sync: { get: async () => ({ [SETTINGS_KEY]: settings() }) },
+          },
+          runtime: {
+            sendMessage: async () => {
+              embeddingCalls++;
+              if (disableAt === "retrieval") enabled = false;
+              return { payload: { ok: false, pending: 0, error: "Offline" } };
+            },
+          },
+        },
+      });
+      const item = {
+        id: "plugin-toggle",
+        text: "solar energy research",
+        platform: "generic" as const,
+        pageUrl: "https://example.com",
+      };
+      const base: ContentAnalysisResult = {
+        id: item.id,
+        text: item.text,
+        findings: [],
+        tips: [],
+        elapsedMs: 0,
+        cached: false,
+      };
+      let release!: (value: ContentAnalysisResult) => void;
+      const baseReady = new Promise<ContentAnalysisResult>((resolve) => {
+        release = resolve;
+      });
+      const { ConfirmationDiagnostics } = await import(
+        "../src/diagnostics/confirmation"
+      );
+      const diagnostics = new ConfirmationDiagnostics();
+      let disableScheduled = false;
+      diagnostics.subscribe(() => {
+        if (
+          disableAt === "waiting" &&
+          !disableScheduled &&
+          diagnostics.get()?.timings?.retrievalMs !== undefined
+        ) {
+          disableScheduled = true;
+          // Let retrieval finish and the service enter its ordinary-analysis wait.
+          setTimeout(() => {
+            void service.analyze({
+              item: { ...item, id: "queued" },
+              base,
+              llm,
+              generation: 1,
+              tabId: 1,
+            });
+            enabled = false;
+            service.cancelPending();
+            release(base);
+          }, 0);
+        }
+      });
+      const llm: LLMService = {
+        backend: "local-api",
+        isAvailable: () => true,
+        complete: async () => "",
+        completeJSON: async (_system, _user, parse) => {
+          llmCalls++;
+          if (disableAt === "inference") enabled = false;
+          return parse('{"findings":[]}');
+        },
+      };
+      const service = new ConfirmationAnalysisService(
+        {
+          // Deliberately independent of settings to test the service's own persisted gates.
+          isCurrent: () => true,
+          onStatus() {},
+          onResult: async () => {
+            applied++;
+          },
+        },
+        diagnostics,
+      );
+      if (disableAt !== "waiting") release(base);
+      await service.analyze({
+        item,
+        base,
+        baseReady,
+        llm,
+        generation: 1,
+        tabId: 1,
+      });
+      assert.equal(llmCalls, disableAt === "inference" ? 1 : 0);
+      assert.equal(applied, 0, "disabled checks must never publish findings");
+      if (disableAt === "before") assert.equal(embeddingCalls, 0);
+      if (disableAt === "waiting") {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.equal(
+          embeddingCalls,
+          1,
+          "cancelled queued checks must not prepare context",
+        );
+        assert.ok(diagnostics.get()!.timings!.baseWaitMs >= 0);
+      }
+      // Existing activity is retained and usable after switching the plugin back on.
+      if (disableAt === "before") {
+        enabled = true;
+        await service.analyze({ item, base, llm, generation: 2, tabId: 1 });
+        assert.equal(llmCalls, 1);
+        assert.equal(applied, 1);
+      }
+    },
+  );
+}
+
+test("CB is a registered history plugin and the ordinary pipeline never calls it", async () => {
+  const { browserPluginRegistry } = await import("../src/plugins/registry");
+  const { analyzeTextWithPlugins } = await import(
+    "../src/sidepanel/analysisService"
+  );
+  const plugin = browserPluginRegistry.get("confirmation-bias-llm")!;
+  assert.equal(plugin.metadata.requiresHistory, true);
+  assert.equal(plugin.metadata.requiresLLM, true);
+  let calls = 0;
+  const llm: LLMService = {
+    backend: "cloud-api",
+    isAvailable: () => true,
+    complete: async () => "",
+    completeJSON: async (_system, _user, parse) => {
+      calls++;
+      return parse('{"findings":[]}');
+    },
+  };
+  const settings = {
+    ...DEFAULT_SETTINGS,
+    selectedBrowserPlugins: [plugin.metadata.id],
+  };
+  const result = await analyzeTextWithPlugins(
+    "solar energy research",
+    settings,
+    llm,
+    {} as never,
+  );
+  assert.deepEqual(result.findings, []);
+  assert.equal(
+    calls,
+    0,
+    "history plugin must only run through the uncached history scheduler",
+  );
+  await seed();
+  const evidence = await related("solar energy research");
+  await browserPluginRegistry.analyzeWith(
+    plugin.metadata.id,
+    "solar energy research",
+    { settings: { ...settings, selectedBrowserPlugins: [] }, evidence, llm },
+  );
+  assert.equal(calls, 0, "plugin also guards disabled direct invocations");
+  await browserPluginRegistry.analyzeWith(
+    plugin.metadata.id,
+    "solar energy research",
+    { settings, evidence, llm },
+  );
+  assert.equal(calls, 1);
+});
+
+function enabledConfirmationStorage() {
+  return {
+    local: { get: async () => ({}) },
+    sync: {
+      get: async () => ({
+        [SETTINGS_KEY]: {
+          ...DEFAULT_SETTINGS,
+          selectedBrowserPlugins: ["confirmation-bias-llm"],
+        },
+      }),
+    },
+  };
+}
+
+test("visit retention removes only visits older than a calendar month, across batches", async () => {
+  const { pruneVisits, visitCutoff } = await import(
+    "../src/activity/maintenance"
+  );
+  await clearActivity();
+  const now = Date.UTC(2026, 2, 31, 12);
+  const cutoff = Date.UTC(2026, 1, 28, 12);
+  assert.equal(visitCutoff(now), cutoff);
+  assert.equal(visitCutoff(Date.UTC(2024, 2, 31)), Date.UTC(2024, 1, 29));
+  assert.equal(visitCutoff(Date.UTC(2026, 0, 15)), Date.UTC(2025, 11, 15));
+  const visit = (at: number): ActivityEvent => ({
+    id: crypto.randomUUID(),
+    kind: "visit",
+    at,
+    url: "https://example.com/",
+    session: "retention",
+  });
+  const expired = Array.from({ length: 450 }, () => visit(cutoff - 1));
+  const boundary = visit(cutoff),
+    recent = visit(now);
+  const liked = event("like", "500", cutoff - 1000);
+  const exposure = event("exposure", "501", cutoff - 1000);
+  await saveEvents([...expired, boundary, recent, liked, exposure]);
+  const before = await activitySummary();
+  const historyRevision = await revision();
+  assert.equal(await pruneVisits(now), 450);
+  assert.equal(await pruneVisits(now), 0);
+  const after = await activitySummary();
+  assert.equal(after.events, 4);
+  assert.equal(after.posts, before.posts);
+  assert.deepEqual(after.accounts, before.accounts);
+  assert.equal(await revision(), historyRevision);
+  const visits = await browseActivity({ kind: "visits" });
+  assert.deepEqual(
+    new Set(visits.rows.map((row) => row.data.id)),
+    new Set([boundary.id, recent.id]),
+  );
+});
+
+test("shared snapshots preserve historical text, dashboard searches and exports", async () => {
+  const { database } = await import("../src/activity/database");
+  const { dashboardRecords, dashboardSummary } = await import(
+    "../src/activity/analytics"
+  );
+  await clearActivity();
+  const first = event("exposure", "700", 1000);
+  first.post!.text = "Original solar evidence ".repeat(12);
+  const liked = {
+    ...first,
+    id: crypto.randomUUID(),
+    kind: "like" as const,
+    at: 1001,
+  };
+  const repeat = { ...first, id: crypto.randomUUID(), at: 1002 };
+  const edited = {
+    ...first,
+    id: crypto.randomUUID(),
+    at: 1003,
+    post: { ...first.post!, text: "Edited solar evidence ".repeat(12) },
+  };
+  await saveEvents([first, liked, repeat, edited, first]);
+  const db = await database();
+  const read = <T>(req: IDBRequest<T>) =>
+    new Promise<T>((resolve, reject) => {
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  assert.equal(
+    await read(db.transaction("texts").objectStore("texts").count()),
+    1,
+  );
+  const stored = await read(
+    db.transaction("events").objectStore("events").getAll(),
+  );
+  assert.equal(stored.length, 4);
+  assert.ok(stored.every((row) => row.post.text === ""));
+  assert.ok(
+    stored
+      .filter((row) => row.kind === "exposure")
+      .every((row) => !row.textKey),
+  );
+  const filter = {
+    from: 0,
+    to: 2000,
+    viewer: "",
+    surface: "all" as const,
+    kind: "all" as const,
+    author: "",
+    query: "Original",
+    day: "",
+    domain: "",
+  };
+  const records = await dashboardRecords(filter);
+  assert.equal(records.rows.length, 1);
+  assert.ok(records.rows.every((row) => row.post!.text === first.post!.text));
+  const summary = await dashboardSummary(filter);
+  assert.equal(summary.exposures, 3);
+  assert.equal(summary.likeActions, 1);
+  const exported = (await (await exportActivity()).text())
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  const events = exported
+    .filter((row) => row.type === "events")
+    .map((row) => row.data);
+  for (const original of [first, liked, repeat, edited])
+    assert.deepEqual(
+      events.find((row) => row.id === original.id),
+      original.kind === "exposure"
+        ? { ...original, post: { ...original.post, text: "" } }
+        : original,
+    );
+  const post = exported.find((row) => row.type === "posts").data;
+  assert.equal(post.likedText, first.post!.text);
+  assert.equal(
+    post.text,
+    liked.post!.text,
+    "exposures cannot overwrite liked content",
+  );
+  const short = event("exposure", "701");
+  short.post!.text = "Brief post";
+  await saveEvents([short]);
+  assert.deepEqual(
+    await read(db.transaction("events").objectStore("events").get(short.id)),
+    { ...short, post: { ...short.post, text: "" } },
+  );
+  assert.equal(
+    await read(db.transaction("texts").objectStore("texts").count()),
+    1,
+    "short text stays inline without extra records",
+  );
+  await clearActivity();
+  assert.equal(
+    await read(db.transaction("texts").objectStore("texts").count()),
+    0,
+  );
+});
+
+test("legacy snapshot compaction resumes without changing events, counts or evidence", async () => {
+  const { database } = await import("../src/activity/database");
+  const { compactSnapshots } = await import("../src/activity/maintenance");
+  await clearActivity();
+  const events = Array.from({ length: 205 }, (_, i) =>
+    event(i === 0 ? "like" : "exposure", "900", 1000 + i),
+  );
+  for (const item of events) item.post!.text = item.post!.text.repeat(5);
+  await saveEvents(events);
+  const before = await activitySummary();
+  const historyRevision = await revision();
+  const db = await database();
+  const tx = db.transaction(["events", "texts"], "readwrite");
+  const done = new Promise<void>((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onabort = () => reject(tx.error);
+  });
+  tx.objectStore("texts").clear();
+  // Simulate the inline event representation written before schema version 6.
+  for (const event of events) tx.objectStore("events").put(event);
+  await done;
+  await compactSnapshots(1);
+  await compactSnapshots(1);
+  await compactSnapshots(1);
+  assert.deepEqual(await activitySummary(), before);
+  assert.equal(await revision(), historyRevision);
+  const exported = (await (await exportActivity()).text())
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  const restored = exported
+    .filter((row) => row.type === "events")
+    .map((row) => row.data);
+  assert.equal(restored.length, events.length);
+  for (const original of events)
+    assert.deepEqual(
+      restored.find((row) => row.id === original.id),
+      original,
+    );
+  const req = db.transaction("texts").objectStore("texts").count();
+  assert.equal(
+    await new Promise<number>((resolve) => {
+      req.onsuccess = () => resolve(req.result);
+    }),
+    1,
+  );
+});
+
+test("storage diagnostics report counts, raw vector bytes and separate storage estimates", async () => {
+  const { storageDiagnostics } = await import("../src/diagnostics/storage");
+  await clearActivity();
+  const liked = event("like");
+  liked.post!.text = liked.post!.text.repeat(5);
+  await saveEvents([liked]);
+  await saveEmbeddings([
+    { key: "reader:123", text: liked.post!.text, embedding: vector(1) },
+  ]);
+  const previousNavigator = Object.getOwnPropertyDescriptor(
+    globalThis,
+    "navigator",
+  );
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: {
+      storage: { estimate: async () => ({ usage: 10000, quota: 20000 }) },
+    },
+  });
+  Object.defineProperty(globalThis, "chrome", {
+    configurable: true,
+    value: {
+      storage: {
+        local: {
+          getBytesInUse: async (key: string | null) => (key ? 100 : 200),
+        },
+      },
+    },
+  });
+  try {
+    const result = await storageDiagnostics();
+    assert.equal(result.likes, 1);
+    assert.equal(result.posts, 1);
+    assert.equal(result.snapshots, 1);
+    assert.equal(result.vectors, 1);
+    assert.equal(result.vectorBytes, 1536);
+    assert.equal(result.localBytes, 200);
+    assert.equal(result.analysisBytes, 100);
+    assert.equal(result.webBytes, 10000);
+    assert.equal(result.quotaBytes, 20000);
+  } finally {
+    if (previousNavigator)
+      Object.defineProperty(globalThis, "navigator", previousNavigator);
+    else Reflect.deleteProperty(globalThis, "navigator");
+  }
+});
+
+interface ActivityStoreRows {
+  events: StoredEvent;
+  posts: StoredPost;
+  accounts: AccountStats;
+  texts: { key: string; text: string };
+}
+async function activityStoreRows<K extends keyof ActivityStoreRows>(
+  name: K,
+): Promise<ActivityStoreRows[K][]> {
+  const { database } = await import("../src/activity/database");
+  const req = (await database()).transaction(name).objectStore(name).getAll();
+  return new Promise((resolve, reject) => {
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+test("unlike deletes the saved like, vector and unused text; retries cannot resurrect it", async () => {
+  await clearActivity();
+  const liked = event("like", "910", 1000);
+  liked.post!.text = "Solar energy evidence ".repeat(15);
+  await saveEvents([liked]);
+  await saveEmbeddings([
+    { key: "reader:910", text: liked.post!.text, embedding: vector(1) },
+  ]);
+  const unlike = {
+    ...liked,
+    id: crypto.randomUUID(),
+    kind: "unlike" as const,
+    at: 2000,
+  };
+  await saveEvents([unlike, unlike]);
+  for (const store of ["events", "posts", "texts", "accounts"] as const)
+    assert.deepEqual(await activityStoreRows(store), [], store);
+  // A late old unlike must not move the deletion timestamp backwards.
+  await saveEvents([
+    { ...unlike, id: crypto.randomUUID(), at: 1200 },
+    { ...liked, id: crypto.randomUUID(), at: 1500 },
+    liked,
+  ]);
+  assert.deepEqual(await activityStoreRows("events"), []);
+  assert.deepEqual(await activityStoreRows("posts"), []);
+  const relike = { ...liked, id: crypto.randomUUID(), at: 3000 };
+  await saveEvents([relike, unlike, liked, relike]);
+  assert.equal((await activityStoreRows("events")).length, 1);
+  assert.equal((await activityStoreRows("events"))[0].id, relike.id);
+  assert.equal((await activityStoreRows("posts"))[0].liked, true);
+  assert.equal((await activitySummary()).accounts[0].likes, 1);
+  const { dashboardSummary } = await import("../src/activity/analytics");
+  const stats = await dashboardSummary({
+    from: 0,
+    to: 4000,
+    viewer: "",
+    surface: "all",
+  });
+  assert.equal(stats.likeActions, 1);
+  assert.equal(stats.likedPosts, 1);
+});
+
+test("unlikes retain exposures and shared snapshots but remove like-only text; authored evidence survives", async () => {
+  await clearActivity();
+  const exposure = event("exposure", "920", 1000);
+  exposure.post!.text = "Visible solar evidence ".repeat(12);
+  const liked = {
+    ...exposure,
+    id: crypto.randomUUID(),
+    kind: "like" as const,
+    at: 1100,
+  };
+  const changedLike = {
+    ...liked,
+    id: crypto.randomUUID(),
+    at: 1200,
+    post: { ...liked.post!, text: "Changed solar evidence ".repeat(12) },
+  };
+  await saveEvents([exposure, liked, changedLike]);
+  await saveEmbeddings([
+    { key: "reader:920", text: changedLike.post.text, embedding: vector(1) },
+  ]);
+  await saveEvents([
+    { ...changedLike, id: crypto.randomUUID(), kind: "unlike", at: 1300 },
+  ]);
+  const records = await activityStoreRows("events");
+  assert.equal(records.length, 1);
+  assert.equal(records[0].id, exposure.id);
+  const texts = await activityStoreRows("texts");
+  assert.equal(texts.length, 0);
+  assert.equal(records[0].post.text, "");
+  const post = (await activityStoreRows("posts"))[0];
+  assert.equal(post.liked, false);
+  assert.equal(post.text, "");
+  assert.deepEqual(post.tokens, []);
+  assert.equal(post.likedText, undefined);
+  assert.equal(post.likedAt, undefined);
+  assert.equal(post.embedding, undefined);
+  assert.equal(post.preferenceAt, undefined);
+  const exported = (await (await exportActivity()).text())
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  assert.deepEqual(exported.find((row) => row.type === "events").data, {
+    ...exposure,
+    post: { ...exposure.post, text: "" },
+  });
+  const own = event("like", "921", 2000, "reader");
+  await saveEvents([own]);
+  await saveEmbeddings([
+    { key: "reader:921", text: own.post!.text, embedding: vector(1) },
+  ]);
+  await saveEvents([
+    { ...own, id: crypto.randomUUID(), kind: "unlike", at: 2100 },
+  ]);
+  const authored = (await activityStoreRows("posts")).find(
+    (row) => row.id === "921",
+  );
+  assert.equal(authored.liked, false);
+  assert.equal(authored.likedText, undefined);
+  assert.ok(
+    authored.embedding,
+    "own post remains independent authored evidence",
+  );
+  assert.ok(
+    (await activityStoreRows("events")).every(
+      (row) => row.kind !== "like" && row.kind !== "unlike",
+    ),
+  );
+});
+
+test("legacy unlike cleanup removes reversed likes while keeping subsequent re-likes", async () => {
+  const { database } = await import("../src/activity/database");
+  const { removeUnlikeHistory } = await import("../src/activity/maintenance");
+  await clearActivity();
+  const old = event("like", "930", 1000);
+  const unlike = {
+    ...old,
+    id: crypto.randomUUID(),
+    kind: "unlike" as const,
+    at: 2000,
+  };
+  const current = { ...old, id: crypto.randomUUID(), at: 3000 };
+  await saveEvents([old, unlike, current]);
+  const tx = (await database()).transaction("events", "readwrite");
+  const done = new Promise<void>((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onabort = () => reject(tx.error);
+  });
+  tx.objectStore("events").put(old);
+  tx.objectStore("events").put(unlike);
+  await done;
+  await removeUnlikeHistory();
+  await removeUnlikeHistory();
+  const records = await activityStoreRows("events");
+  assert.equal(records.length, 1);
+  assert.equal(records[0].id, current.id);
+  assert.equal((await activityStoreRows("posts"))[0].likedAt, 3000);
+  assert.equal((await activitySummary()).accounts[0].likes, 1);
+  const finalTx = (await database()).transaction("events", "readwrite");
+  const finalDone = new Promise<void>((resolve, reject) => {
+    finalTx.oncomplete = () => resolve();
+    finalTx.onabort = () => reject(finalTx.error);
+  });
+  finalTx
+    .objectStore("events")
+    .put({ ...unlike, id: crypto.randomUUID(), at: 4000 });
+  await finalDone;
+  await removeUnlikeHistory();
+  assert.deepEqual(await activityStoreRows("events"), []);
+  assert.deepEqual(await activityStoreRows("posts"), []);
+  assert.deepEqual(await activityStoreRows("accounts"), []);
+});
+
+const newsSnapshot = (count = 120) => ({
+  source: "mediacloud",
+  scope: "geographic-publishers-v1",
+  publishedAt: "2026-01-08",
+  version: "mediacloud-curated:" + "a".repeat(64),
+  fetchedAt: Date.UTC(2026, 9, 24),
+  domains: [
+    "bbc.com",
+    "bbc.co.uk",
+    "foxnews.com",
+    ...Array.from({ length: count }, (_, i) => `news-test-${i}.com`),
+  ],
+});
+
+test("Media Cloud domains match subdomains but exclude public suffixes and lookalikes", async () => {
+  const { parseNewsCatalog, newsMatcher } = await import(
+    "../src/activity/news"
+  );
+  const fixture = newsSnapshot();
+  fixture.domains.push(
+    "WWW.BBC.COM",
+    "co.uk",
+    "blogspot.com",
+    "https://example.com/path",
+  );
+  const catalog = parseNewsCatalog(JSON.stringify(fixture));
+  assert.equal(catalog.domains.filter((d) => d === "bbc.com").length, 1);
+  assert.ok(
+    !catalog.domains.includes("co.uk") &&
+      !catalog.domains.includes("blogspot.com"),
+  );
+  const matches = newsMatcher(catalog);
+  for (const url of [
+    "https://bbc.com/news",
+    "https://www.bbc.com/news",
+    "https://news.bbc.co.uk/article",
+    "http://foxnews.com/story",
+  ])
+    assert.equal(matches(url), true, url);
+  for (const url of [
+    "https://bbc.com.evil.com",
+    "https://notbbc.com",
+    "https://other.co.uk",
+    "https://bbc.com@evil.com",
+    "ftp://bbc.com",
+    "https://wikipedia.org",
+    "https://x.com/home",
+  ])
+    assert.equal(matches(url), false, url);
+  assert.equal(newsMatcher()("https://bbc.com"), false);
+  assert.throws(() => parseNewsCatalog("<html>error</html>"));
+  assert.throws(() =>
+    parseNewsCatalog(JSON.stringify({ ...fixture, scope: "all-sources" })),
+  );
+  assert.throws(() =>
+    parseNewsCatalog(JSON.stringify({ ...fixture, source: "old-provider" })),
+  );
+  assert.throws(() =>
+    parseNewsCatalog(JSON.stringify({ ...fixture, domains: ["bbc.com"] })),
+  );
+});
+
+test("Media Cloud refresh uses one backend request; navigation is local and failures preserve the cache", async () => {
+  const { NewsCatalogService } = await import("../src/activity/news");
+  let state: import("../src/activity/news").NewsCatalogState = {};
+  let fail = false;
+  const requests: Array<{ url: string; options?: RequestInit }> = [];
+  const service = new NewsCatalogService({
+    read: async () => structuredClone(state),
+    write: async (value) => {
+      state = structuredClone(value);
+    },
+    now: () => Date.UTC(2026, 9, 24),
+    endpoint: async () => "http://localhost:8787/news/sources",
+    fetch: async (input, options) => {
+      requests.push({ url: String(input), options });
+      if (fail) throw new Error("Offline");
+      return Response.json(newsSnapshot());
+    },
+  });
+  assert.equal(await service.matches("https://bbc.com"), false);
+  await Promise.all([service.refresh(), service.refresh()]);
+  assert.equal(requests.length, 1);
+  assert.equal(
+    await service.matches("https://bbc.com/news/private-title"),
+    true,
+  );
+  assert.equal(await service.matches("https://unlisted.example"), false);
+  assert.equal(requests.length, 1, "matching never makes network requests");
+  assert.equal(requests[0].url, "http://localhost:8787/news/sources");
+  assert.equal(requests[0].options?.credentials, "omit");
+  assert.equal(requests[0].options?.referrerPolicy, "no-referrer");
+  assert.equal(
+    requests[0].options?.headers,
+    undefined,
+    "no Media Cloud key in extension",
+  );
+  const previous = structuredClone(state.catalog);
+  fail = true;
+  await service.refresh();
+  assert.equal(requests.length, 2);
+  assert.deepEqual(state.catalog, previous);
+  assert.ok(state.error);
+  assert.equal(await service.matches("https://bbc.com"), true);
+});
+
+for (const problem of [
+  "revision",
+  "provider",
+  "empty",
+  "oversized",
+  "shrink",
+] as const) {
+  test(`Media Cloud rejects ${problem} without replacing its cache`, async () => {
+    const { NewsCatalogService, parseNewsCatalog } = await import(
+      "../src/activity/news"
+    );
+    let state: import("../src/activity/news").NewsCatalogState = {
+      catalog: parseNewsCatalog(JSON.stringify(newsSnapshot(500))),
+    };
+    const original = structuredClone(state.catalog);
+    const fixture = newsSnapshot();
+    if (problem === "revision") fixture.version = "../../other";
+    if (problem === "provider") fixture.source = "github";
+    if (problem === "empty") fixture.domains = [];
+    const service = new NewsCatalogService({
+      read: async () => structuredClone(state),
+      write: async (value) => {
+        state = value;
+      },
+      now: () => Date.UTC(2026, 9, 24),
+      endpoint: async () => "http://localhost:8787/news/sources",
+      fetch: async () =>
+        new Response(
+          JSON.stringify(fixture),
+          problem === "oversized"
+            ? { headers: { "Content-Length": "64000001" } }
+            : undefined,
+        ),
+    });
+    await service.refresh();
+    assert.ok(state.error);
+    assert.deepEqual(state.catalog, original);
+  });
+}
+
+test("Media Cloud cache does not reuse the former provider's list", async () => {
+  const { database } = await import("../src/activity/database");
+  const { NEWS_CATALOG_KEY } = await import("../src/activity/model");
+  const { readNewsState } = await import("../src/activity/news");
+  const tx = (await database()).transaction("meta", "readwrite");
+  tx.objectStore("meta").delete(NEWS_CATALOG_KEY);
+  tx.objectStore("meta").put({ catalog: newsSnapshot() }, "newsCatalogV1");
+  tx.objectStore("meta").put(
+    { catalog: newsSnapshot() },
+    "mediaCloudCatalogV1",
+  );
+  await new Promise<void>((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onabort = () => reject(tx.error);
+  });
+  assert.equal((await readNewsState()).catalog, undefined);
+});
+
+test("news-only dashboard filters legacy visits and cleanup retains X and recognized news", async () => {
+  const { database } = await import("../src/activity/database");
+  const { pruneNonNewsVisits } = await import("../src/activity/maintenance");
+  const { dashboardSummary, dashboardRecords } = await import(
+    "../src/activity/analytics"
+  );
+  const { NEWS_CATALOG_KEY } = await import("../src/activity/model");
+  const { readNewsState } = await import("../src/activity/news");
+  await clearActivity();
+  const catalog = {
+    domains: ["bbc.com"],
+    version: "fixture-1",
+    fetchedAt: Date.now(),
+  };
+  const tx = (await database()).transaction("meta", "readwrite");
+  const done = new Promise<void>((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onabort = () => reject(tx.error);
+  });
+  tx.objectStore("meta").put({ catalog }, NEWS_CATALOG_KEY);
+  await done;
+  const visit = (url: string): ActivityEvent => ({
+    id: crypto.randomUUID(),
+    kind: "visit",
+    url,
+    at: 1000,
+    session: "news-test",
+  });
+  const news = visit("https://www.bbc.com/news/story");
+  const liked = event("like", "970", 1000);
+  await saveEvents([
+    news,
+    ...Array.from({ length: 450 }, () => visit("https://not-news.example")),
+    ...[
+      "https://login.microsoftonline.com",
+      "https://mail.google.com",
+      "https://lichess.org",
+    ].map(visit),
+    liked,
+  ]);
+  const filter = {
+    from: 0,
+    to: 2000,
+    viewer: "",
+    surface: "all" as const,
+    kind: "all" as const,
+    author: "",
+    query: "",
+    day: "",
+    domain: "",
+  };
+  const summary = await dashboardSummary(filter);
+  assert.equal(summary.visits, 1);
+  assert.equal(summary.likedPosts, 1);
+  assert.deepEqual(
+    new Set((await dashboardRecords(filter)).rows.map((row) => row.id)),
+    new Set([news.id, liked.id]),
+  );
+  await pruneNonNewsVisits(catalog);
+  const remaining = await activityStoreRows("events");
+  assert.deepEqual(
+    new Set(remaining.map((row) => row.id)),
+    new Set([news.id, liked.id]),
+  );
+  await clearActivity();
+  assert.deepEqual(
+    (await readNewsState()).catalog,
+    catalog,
+    "public list survives deleting personal history",
+  );
+  assert.equal((await activityStoreRows("events")).length, 0);
+});
+
+test("visit collection saves only recognized news and excludes paused, incognito and stale navigations", async () => {
+  await clearActivity();
+  const { database } = await import("../src/activity/database");
+  const { NEWS_CATALOG_KEY } = await import("../src/activity/model");
+  const tx = (await database()).transaction("meta", "readwrite");
+  const stored = new Promise<void>((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onabort = () => reject(tx.error);
+  });
+  tx.objectStore("meta").put(
+    {
+      catalog: {
+        domains: ["bbc.com"],
+        fetchedAt: Date.now(),
+        version: "collector-fixture",
+      },
+    },
+    NEWS_CATALOG_KEY,
+  );
+  await stored;
+  let tracking = true,
+    incognito = false;
+  let tabUrl = "https://www.bbc.com/news/story?tracking=1";
+  const session: Record<string, unknown> = {};
+  let onRemoved: (tabId: number) => void = () => {};
+  Object.defineProperty(globalThis, "chrome", {
+    configurable: true,
+    value: {
+      runtime: {
+        id: "test-extension",
+        getURL: (path: string) => `chrome-extension://test-extension/${path}`,
+        onMessage: { addListener() {} },
+        onInstalled: { addListener() {} },
+        onStartup: { addListener() {} },
+      },
+      tabs: {
+        onRemoved: { addListener(listener: typeof onRemoved) { onRemoved = listener; } },
+        get: async () => ({ url: tabUrl, title: "News story", incognito }),
+      },
+      storage: {
+        session: {
+          get: async (key: string) => ({ [key]: session[key] }),
+          set: async (values: Record<string, unknown>) => { Object.assign(session, values); },
+          remove: async (key: string) => { delete session[key]; },
+        },
+        local: { get: async () => ({ vigilActivitySettingsV1: { tracking } }) },
+        onChanged: { addListener() {} },
+      },
+      alarms: {
+        get: async () => ({ name: "vigil-activity-maintenance" }),
+        onAlarm: { addListener() {} },
+      },
+      webNavigation: {
+        onCommitted: { addListener() {} },
+        onHistoryStateUpdated: { addListener() {} },
+      },
+    },
+  });
+  const { recordNewsVisit } = await import("../src/activity/background");
+  await recordNewsVisit(1, tabUrl, "news-session");
+  tabUrl = "https://www.bbc.com/news/story?tracking=2#section";
+  await Promise.all(Array.from({ length: 270 }, (_, i) =>
+    recordNewsVisit(1, tabUrl, `reload-${i}`),
+  ));
+  assert.equal((await activityStoreRows("events")).length, 1);
+  // Stored session state is sufficient even without any in-memory tab cache.
+  session["vigilNewsVisitTab:2"] = cleanUrl(tabUrl);
+  await recordNewsVisit(2, tabUrl, "worker-restarted");
+  assert.equal((await activityStoreRows("events")).length, 1);
+  await recordNewsVisit(
+    1,
+    "https://ordinary.example/private",
+    "ordinary-session",
+  );
+  await recordNewsVisit(1, "https://x.com/home", "x-session");
+  incognito = true;
+  await recordNewsVisit(1, tabUrl, "incognito");
+  incognito = false;
+  tracking = false;
+  await recordNewsVisit(1, tabUrl, "paused");
+  tracking = true;
+  tabUrl = "https://ordinary.example/now";
+  await recordNewsVisit(1, "https://www.bbc.com/news/story", "stale");
+  const records = await activityStoreRows("events");
+  assert.equal(records.length, 1);
+  assert.equal(records[0].kind, "visit");
+  assert.equal(records[0].url, "https://www.bbc.com/news/story");
+
+  tabUrl = "https://www.bbc.com/news/another";
+  await recordNewsVisit(1, tabUrl, "another-article");
+  tabUrl = "https://ordinary.example/";
+  await recordNewsVisit(1, tabUrl, "leave");
+  tabUrl = "https://www.bbc.com/news/another";
+  await recordNewsVisit(1, tabUrl, "return");
+  await recordNewsVisit(3, tabUrl, "separate-tab");
+  assert.equal((await activityStoreRows("events")).length, 4);
+  onRemoved(3);
+  await recordNewsVisit(3, tabUrl, "reused-tab-id");
+  assert.equal((await activityStoreRows("events")).length, 5);
+});
+
+test("share charts preserve the full total, group the tail, and safely drill into named sources", async () => {
+  const { renderShare } = await import("../src/activity/charts");
+  const previousDocument = globalThis.document;
+  const dom = new JSDOM("<div id='chart'></div>");
+  Object.defineProperty(globalThis, "document", {
+    value: dom.window.document,
+    configurable: true,
+  });
+  try {
+    const chart = document.getElementById("chart")!;
+    let selected = "";
+    const data = Array.from({ length: 6 }, (_, i) => ({
+      key: String(i),
+      label: i === 0 ? "<img src=x>" : String(i),
+      value: 10,
+    }));
+    renderShare(chart, data, 100, "views", (key) => {
+      selected = key;
+    });
+    assert.equal(chart.querySelector("img"), null);
+    assert.equal(chart.querySelectorAll("button").length, 5);
+    assert.match(
+      chart.querySelector(".share-legend")!.textContent!,
+      /Other50%/,
+    );
+    assert.match(
+      chart.querySelector("button")!.getAttribute("aria-label")!,
+      /10 \(10%\)/,
+    );
+    chart.querySelector("button")!.click();
+    assert.equal(selected, "0");
+    assert.equal(
+      chart.querySelector(".share-center strong")!.textContent,
+      "100",
+    );
+    renderShare(chart, data.slice(0, 1), 10, "views", () => {});
+    assert.doesNotMatch(chart.textContent!, /Other/);
+    assert.match(chart.textContent!, /100%/);
+    renderShare(chart, [], 0, "views", () => {});
+    assert.equal(chart.childElementCount, 0);
+  } finally {
+    Object.defineProperty(globalThis, "document", {
+      value: previousDocument,
+      configurable: true,
+    });
+    dom.window.close();
+  }
+});
+
+test("legacy exposure content cleanup resumes, preserves statistics and shared preference text", async () => {
+  const { database } = await import("../src/activity/database");
+  const { removeExposureContent } = await import("../src/activity/maintenance");
+  const { snapshotKey, storeSnapshot } = await import(
+    "../src/activity/snapshots"
+  );
+  await clearActivity();
+  const exposures = Array.from({ length: 205 }, (_, i) =>
+    event("exposure", String(8000 + i), 1000 + i),
+  );
+  exposures[0].post!.text = "Exposure-only private content ".repeat(10);
+  exposures[1].post!.text = "Shared liked content ".repeat(10);
+  const liked = {
+    ...exposures[1],
+    id: crypto.randomUUID(),
+    kind: "like" as const,
+  };
+  const own = event("exposure", "9000", 2000, "reader");
+  await saveEvents([...exposures, liked, own]);
+  const before = await activitySummary();
+  const originalRevision = await revision();
+  const keys = await Promise.all(
+    exposures.map((e) => snapshotKey(e.post!.text)),
+  );
+  const db = await database();
+  const tx = db.transaction(["events", "posts", "texts"], "readwrite");
+  const finished = new Promise<void>((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onabort = () => reject(tx.error);
+  });
+  exposures.forEach((e, i) => {
+    tx.objectStore("events").put(storeSnapshot(tx, e, keys[i]));
+    if (i !== 1)
+      tx.objectStore("posts").put({
+        ...e.post,
+        key: `reader:${e.post!.id}`,
+        at: e.at,
+        liked: false,
+        tokens: ["private"],
+        likedTokens: [],
+        embedding: new Float32Array([1]),
+      });
+  });
+  await finished;
+  await removeExposureContent(1);
+  await removeExposureContent(1);
+  await removeExposureContent(1);
+  assert.deepEqual(await activitySummary(), before);
+  assert.equal(await revision(), originalRevision);
+  const storedEvents = await activityStoreRows("events");
+  for (const e of storedEvents.filter(
+    (e) => e.kind === "exposure" && e.post.author !== "reader",
+  )) {
+    assert.equal(e.post.text, "");
+    assert.equal(e.textKey, undefined);
+  }
+  const texts = await activityStoreRows("texts");
+  assert.equal(texts.length, 1);
+  assert.equal(texts[0].text, liked.post!.text);
+  const posts = await activityStoreRows("posts");
+  for (const p of posts.filter((p) => !p.liked && p.author !== "reader")) {
+    assert.equal(p.text, "");
+    assert.deepEqual(p.tokens, []);
+    assert.equal(p.embedding, undefined);
+  }
+  assert.equal(
+    posts.find((p) => p.id === liked.post!.id).likedText,
+    liked.post!.text,
+  );
+  assert.equal(posts.find((p) => p.id === own.post!.id).text, own.post!.text);
+});
+
+test("exposure and like rankings exclude own posts per viewing identity and preserve raw records", async () => {
+  const { createSummary, matchesRecord } = await import(
+    "../src/activity/analytics"
+  );
+  const filter = { from: 0, to: 1000, viewer: "", surface: "all" as const };
+  const own = event("exposure", "101", 200, "READER");
+  const otherView = {
+    ...own,
+    id: crypto.randomUUID(),
+    post: { ...own.post!, viewer: "another" },
+  };
+  const ownLike = { ...own, id: crypto.randomUUID(), kind: "like" as const };
+  const otherLike = {
+    ...otherView,
+    id: crypto.randomUUID(),
+    kind: "like" as const,
+  };
+  const unknown = {
+    ...own,
+    id: crypto.randomUUID(),
+    post: { ...own.post!, viewer: "unknown" },
+  };
+  const summary = createSummary(filter);
+  [own, otherView, ownLike, otherLike, unknown].forEach(summary.add);
+  const result = summary.result();
+  assert.equal(result.exposures, 2);
+  assert.equal(result.uniqueSeen, 2);
+  assert.equal(result.accounts[0].exposures, 2);
+  assert.equal(result.likedPosts, 1);
+  assert.equal(result.likeActions, 1);
+  assert.equal(result.accounts[0].likedPosts, 1);
+  assert.equal(result.days[0].likeActions, 1);
+  assert.equal(result.days[0].exposures, 2);
+  const records = {
+    ...filter,
+    kind: "exposure" as const,
+    author: "",
+    query: "",
+    day: "",
+    domain: "",
+  };
+  assert.equal(matchesRecord(own, records), false);
+  assert.equal(matchesRecord(otherView, records), true);
+  assert.equal(matchesRecord(own, { ...records, kind: "all" }), true);
+  assert.equal(matchesRecord(ownLike, { ...records, kind: "like" }), false);
+  assert.equal(matchesRecord(otherLike, { ...records, kind: "like" }), true);
+  assert.equal(matchesRecord(ownLike, { ...records, kind: "all" }), true);
+  const viewerSummary = createSummary({ ...filter, viewer: "reader" });
+  [own, otherView, ownLike, otherLike, unknown].forEach(viewerSummary.add);
+  assert.equal(viewerSummary.result().exposures, 0);
+  assert.equal(viewerSummary.result().likedPosts, 0);
+});

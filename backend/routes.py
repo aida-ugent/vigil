@@ -15,6 +15,8 @@ from models import (
     ReformulationResult,
 )
 from plugins.registry import PluginRegistry
+from ollama_proxy import router as ollama_router
+from news_catalog import router as news_router
 
 logger = logging.getLogger("vigil")
 
@@ -51,6 +53,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title=settings.app_name)
     app.state.settings = settings
+    app.include_router(ollama_router)
+    app.include_router(news_router)
 
     app.add_middleware(
         CORSMiddleware,

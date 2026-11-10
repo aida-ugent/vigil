@@ -15,6 +15,21 @@ Vigil is a Chrome extension that flags rhetorical patterns likely to trigger cog
   - optional LLM plugin in-browser (WebLLM), local API (Ollama), or cloud API
   - optional backend plugin server (`FastAPI`) for additional analyzers (for example: moralization detection)
 
+### optional activity features
+
+- **Confirmation bias:** an optional plugin uses relevant posts you have liked or
+  written on X to flag claims that reinforce those views with little visible
+  supporting evidence. A **CB?** badge shows an explanation on hover. Enable it
+  under **Settings → Plugins** alongside the existing detectors.
+- **Influence Dashboard:** interactive charts show which X accounts you see and
+  like most, and which recognized news sites you visit.
+
+Enable **Track interactions** to build the local activity history. Ordinary seen
+posts retain metadata only; liked and self-authored posts retain their text.
+Confirmation-bias checks send relevant excerpts to your selected LLM provider.
+
+[Activity setup, privacy, and diagnostics](docs/activity.md)
+
 ## who this is for
 
 - Readers who want support processing information more rationally
@@ -54,7 +69,7 @@ Use the labels below to map each part of the UI quickly.
 ### requirements
 
 - Chrome 118 or newer
-- Node.js 18+ (for local build)
+- Node.js 24.15+ LTS (or 22.22.2+) for local build
 - Optional:
   - WebGPU-capable browser/GPU for WebLLM mode
   - local Ollama for local API mode
@@ -66,6 +81,16 @@ Use the labels below to map each part of the UI quickly.
 cd frontend
 npm install
 npm run build
+```
+
+Build and dev commands prepare the embedding model and ONNX runtime automatically.
+Model weights are downloaded from a pinned Hugging Face revision, checked against
+SHA-256 hashes, and reused on later builds. Embedding inference runs offline.
+
+With nvm installed, run `nvm install && nvm use` inside `frontend` first.
+
+```bash
+bash scripts/package.sh
 ```
 
 Then in Chrome:

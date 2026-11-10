@@ -38,7 +38,7 @@ function partitionSelectedPlugins(pluginIds: string[]): { local: string[]; llm: 
   const llm: string[] = [];
   for (const id of pluginIds) {
     const plugin = browserPluginRegistry.get(id);
-    if (!plugin) continue;
+    if (!plugin || plugin.metadata.requiresHistory) continue;
     if (plugin.metadata.requiresLLM) llm.push(id);
     else local.push(id);
   }

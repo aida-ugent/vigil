@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.11"
 
 [[package]]
@@ -1832,6 +1832,7 @@ version = "2.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "litellm" },
     { name = "pydantic" },
     { name = "python-dotenv" },
@@ -1857,6 +1858,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", specifier = ">=0.115.0" },
+    { name = "httpx", specifier = ">=0.27.0" },
     { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27.0" },
     { name = "litellm", specifier = ">=1.81.0" },
     { name = "pydantic", specifier = ">=2.7.0" },
