@@ -219,7 +219,9 @@ If you are planning production use, pin a release and validate behavior against 
 
 ## acknowledgements
 
-Funded by the European Union (ERC, VIGILIA, 101142229) and the Flanders AI Research program (FAIR). Views and opinions expressed are those of the authors only and do not necessarily reflect those of the EU or the ERCEA.
+<img src="docs/assets/readme/erc-eu-logo.png" alt="Funded by the European Union · European Research Council" width="360">
+
+Funded by the European Union (ERC, VIGILIA, 101142229). Views and opinions expressed are however those of the author(s) only and do not necessarily reflect those of the European Union or the European Research Council Executive Agency. Neither the European Union nor the granting authority can be held responsible for them. Also supported by the Flanders AI Research program (FAIR).
 
 ## license
 
